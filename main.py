@@ -1,87 +1,55 @@
 import os
+import pickle
+import cv2
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from ultralytics import YOLO
+import face_recognition
 
-
-from ultralytics import RTDETR
-from super_gradients.training import models
-
-# model = RTDETR("rtdetr-l.pt")
-model = YOLO("yolov8l.pt")
+# Инициализация моделей
+model = YOLO("yolov8l.pt")  # Модель для распознавания тренажеров
 
 GYM_EQUIPMENT_CLASSES = [
-    # 1. Силовые тренажёры и оборудование
-    "dumbbell",          # гантель
-    "barbell",           # штанга
-    "kettlebell",        # гиря
-    "weight plate",      # блин для штанги
-    "medicine ball",     # медбол
-    "resistance band",   # эспандер
-    "pull-up bar",       # турник
-    "weight bench",      # скамья для жима
-    "power rack",        # силовая рама
-    "smith machine",     # тренажёр Смита
-    "leg press machine", # тренажёр для жима ногами
-    "cable machine",     # кроссовер (блочный тренажёр)
-    "ab roller",         # ролик для пресса
-
-    # 2. Кардиотренажёры
-    "treadmill",         # беговая дорожка
-    "exercise bike",     # велотренажёр
-    "elliptical machine",# эллипсоид
-    "rowing machine",    # гребной тренажёр
-    "stair climber",     # степпер
-    "spin bike",         # спинбайк
-
-    # 3. Гимнастика и функциональный тренинг
-    "yoga mat",          # коврик для йоги
-    "foam roller",       # массажный ролик
-    "jump rope",         # скакалка
-    "gymnastic rings",   # гимнастические кольца
-    "parallette bars",   # параллельные брусья
-    "balance board",     # балансборд
-
-    # 4. Игровые виды спорта
-    "sports ball",       # мяч (общий)
-    "basketball",        # баскетбольный мяч
-    "soccer ball",       # футбольный мяч
-    "volleyball",        # волейбольный мяч
-    "tennis racket",     # теннисная ракетка
-    "tennis ball",       # теннисный мяч
-    "golf club",         # клюшка для гольфа
-    "golf ball",         # мяч для гольфа
-    "ping pong paddle",  # ракетка для пинг-понга
-    "badminton racket",  # ракетка для бадминтона
-    "hockey stick",      # клюшка для хоккея
-
-    # 5. Зимние виды спорта
-    "skis",              # лыжи
-    "ski poles",         # лыжные палки
-    "snowboard",         # сноуборд
-    "ice skates",        # коньки
-
-    # 6. Водные виды спорта
-    "surfboard",         # серфборд
-    "paddle board",      # сапборд
-    "kayak",             # байдарка
-    "swimming goggles",  # плавательные очки
-
-    # 7. Экстремальные и уличные
-    "skateboard",        # скейтборд
-    "bmx bike",          # BMX-велосипед
-    "climbing harness",  # альпинистская обвязка
-    "carabiner",         # карабин
-
-
     "chair",
     "bench"
 ]
 
+# Настройки для распознавания лиц
+FACE_DATA_DIR = "face_data"
+os.makedirs(FACE_DATA_DIR, exist_ok=True)
 
+
+# Функции для работы с лицами
+def load_face_database():
+    try:
+        with open(os.path.join(FACE_DATA_DIR, "faces.pkl"), "rb") as f:
+            return pickle.load(f)
+    except (FileNotFoundError, EOFError):
+        return {"encodings": [], "names": []}
+
+
+def save_face_database(database):
+    with open(os.path.join(FACE_DATA_DIR, "faces.pkl"), "wb") as f:
+        pickle.dump(database, f)
+
+
+def draw_faces(image_path, face_locations, names):
+    image = cv2.imread(image_path)
+    for (top, right, bottom, left), name in zip(face_locations, names):
+        cv2.rectangle(image, (left, top), (right, bottom), (0, 255, 0), 2)
+        cv2.putText(image, name, (left, top - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    output_path = "output_" + os.path.basename(image_path)
+    cv2.imwrite(output_path, image)
+    return output_path
+
+
+# Команды бота
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Отправь мне фото, и я скажу, есть ли на нём тренажёр."
+        "Привет! Я могу:\n"
+        "1. Распознавать тренажеры на фото (просто отправь фото)\n"
+        "2. Запоминать и распознавать лица (используй /nameface <имя> чтобы назвать лицо)"
     )
 
 
@@ -91,40 +59,86 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_path = f"temp_{update.message.message_id}.jpg"
     await photo_file.download_to_drive(photo_path)
 
-    # Анализ фото через YOLO
+    # Сначала проверяем на тренажеры
     results = model(photo_path)
 
-    # Проверяем, есть ли тренажёры
-    class_name_pr=""
+    class_name_pr = ""
     found_equipment = False
     for result in results:
         for box in result.boxes:
             class_name = result.names[int(box.cls)]
-            class_name_pr+=class_name+" "
-            print(class_name)
+            class_name_pr += class_name + " "
             if class_name in GYM_EQUIPMENT_CLASSES:
                 found_equipment = True
-                break
 
-    # Удаляем временный файл
+    # Затем проверяем на лица
+    image = face_recognition.load_image_file(photo_path)
+    face_locations = face_recognition.face_locations(image)
+    face_message = ""
+
+    if face_locations:
+        face_encodings = face_recognition.face_encodings(image, face_locations)
+        face_db = load_face_database()
+        recognized_names = []
+
+        for face_encoding in face_encodings:
+            matches = face_recognition.compare_faces(face_db["encodings"], face_encoding)
+            name = "Unknown"
+
+            if True in matches:
+                first_match_index = matches.index(True)
+                name = face_db["names"][first_match_index]
+            else:
+                name = f"User_{update.message.from_user.id}_{len(face_db['encodings'])}"
+                face_db["encodings"].append(face_encoding)
+                face_db["names"].append(name)
+                save_face_database(face_db)
+
+            recognized_names.append(name)
+
+        output_path = draw_faces(photo_path, face_locations, recognized_names)
+        await update.message.reply_photo(
+            photo=open(output_path, "rb"),
+            caption=f"Распознанные лица: {', '.join(recognized_names)}"
+        )
+        os.remove(output_path)
+        face_message = f"\n\nНайдены лица: {', '.join(recognized_names)}"
+    else:
+        face_message = "\n\nЛица не обнаружены."
+
+    # Отправляем результат
+    if found_equipment:
+        await update.message.reply_text(f"✅ Да, на фото есть тренажёр! {class_name_pr}{face_message}")
+    else:
+        await update.message.reply_text(f"❌ Нет, на фото не обнаружено тренажёров. {class_name_pr}{face_message}")
+
     os.remove(photo_path)
 
-    # Отправляем ответ
-    if found_equipment:
-        await update.message.reply_text("✅ Да, на фото есть тренажёр! "+class_name_pr)
-    else:
-        await update.message.reply_text("❌ Нет, на фото не обнаружено тренажёров."+class_name_pr)
+
+async def name_face(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /nameface <имя>")
+        return
+
+    face_db = load_face_database()
+    if not face_db["encodings"]:
+        await update.message.reply_text("Нет сохраненных лиц.")
+        return
+
+    new_name = ' '.join(context.args)
+    face_db["names"][-1] = new_name
+    save_face_database(face_db)
+    await update.message.reply_text(f"Последнее лицо сохранено как: {new_name}")
 
 
 if __name__ == "__main__":
-    # 3. Настройка бота
     TOKEN = "8006388827:AAGg4xPDWHjQ8aaS30-fSy97YK7jBUUabgQ"
     app = Application.builder().token(TOKEN).build()
 
-    # 4. Регистрация обработчиков
+    # Регистрация обработчиков
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("nameface", name_face))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # 5. Запуск бота
     print("Бот запущен...")
     app.run_polling()
