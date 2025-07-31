@@ -5,8 +5,10 @@ from ultralytics import YOLO
 
 
 from ultralytics import RTDETR
-model = RTDETR("rtdetr-l.pt")
+from super_gradients.training import models
 
+# model = RTDETR("rtdetr-l.pt")
+model = YOLO("yolov8l.pt")
 
 GYM_EQUIPMENT_CLASSES = [
     # 1. Силовые тренажёры и оборудование
@@ -93,10 +95,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = model(photo_path)
 
     # Проверяем, есть ли тренажёры
+    class_name_pr=""
     found_equipment = False
     for result in results:
         for box in result.boxes:
             class_name = result.names[int(box.cls)]
+            class_name_pr+=class_name+" "
             print(class_name)
             if class_name in GYM_EQUIPMENT_CLASSES:
                 found_equipment = True
@@ -107,9 +111,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Отправляем ответ
     if found_equipment:
-        await update.message.reply_text("✅ Да, на фото есть тренажёр!")
+        await update.message.reply_text("✅ Да, на фото есть тренажёр! "+class_name_pr)
     else:
-        await update.message.reply_text("❌ Нет, на фото не обнаружено тренажёров.")
+        await update.message.reply_text("❌ Нет, на фото не обнаружено тренажёров."+class_name_pr)
 
 
 if __name__ == "__main__":
