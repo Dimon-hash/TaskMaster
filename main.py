@@ -1,8 +1,15 @@
 import os
 import pickle
 import cv2
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler
+)
 from ultralytics import YOLO
 import urllib.request
 
@@ -97,6 +104,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def list_faces(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    face_db = load_face_database()
+
+    if not face_db["names"]:
+        await update.message.reply_text("Нет сохраненных лиц.")
+        return
+
+    # Формируем список всех имен
+    faces_list = "\n".join(
+        f"{i + 1}. {name}" for i, name in enumerate(face_db["names"])
+    )
+
+    await update.message.reply_text(
+        "Сохраненные лица:\n" + faces_list,
+        parse_mode='Markdown'
+    )
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Скачиваем фото
@@ -175,6 +199,68 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(photo_path)
 
 
+async def rename_face(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /renameface <номер> <новое_имя>\n"
+            "Пример: /renameface 2 NewName\n\n"
+            "Сначала посмотрите номера лиц через /listfaces"
+        )
+        return
+
+    try:
+        face_num = int(context.args[0]) - 1  # Переводим в 0-based индекс
+        new_name = ' '.join(context.args[1:])
+
+        face_db = load_face_database()
+
+        if face_num < 0 or face_num >= len(face_db["names"]):
+            await update.message.reply_text("Неверный номер лица!")
+            return
+
+        old_name = face_db["names"][face_num]
+        face_db["names"][face_num] = new_name
+        save_face_database(face_db)
+
+        await update.message.reply_text(
+            f"Лицо успешно переименовано:\n"
+            f"Было: {old_name}\n"
+            f"Стало: {new_name}"
+        )
+
+    except ValueError:
+        await update.message.reply_text("Номер должен быть целым числом!")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+
+
+async def clear_faces(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Подтверждение через клавиатуру
+    keyboard = [
+        [InlineKeyboardButton("Да, очистить", callback_data="clear_confirm")],
+        [InlineKeyboardButton("Отмена", callback_data="clear_cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "Вы уверены, что хотите удалить ВСЕ сохранённые лица?",
+        reply_markup=reply_markup
+    )
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "clear_confirm":
+        # Создаём новую чистую базу
+        new_db = {"features": [], "names": []}
+        save_face_database(new_db)
+
+        await query.edit_message_text("✅ Все лица успешно удалены!")
+    elif query.data == "clear_cancel":
+        await query.edit_message_text("❌ Удаление отменено")
+
 async def name_face(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Использование: /nameface <имя>")
@@ -196,9 +282,13 @@ if __name__ == "__main__":
     try:
         app = Application.builder().token(TOKEN).build()
 
+        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("nameface", name_face))
-        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        app.add_handler(CommandHandler("listfaces", list_faces))
+        app.add_handler(CommandHandler("renameface", rename_face))
+        app.add_handler(CommandHandler("clearfaces", clear_faces))
+        app.add_handler(CallbackQueryHandler(button_handler))
 
         print("Бот запущен...")
         app.run_polling()
