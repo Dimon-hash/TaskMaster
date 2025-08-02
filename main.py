@@ -1,6 +1,8 @@
 import os
 import pickle
 import cv2
+from openai import OpenAI
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,6 +15,41 @@ from telegram.ext import (
 from ultralytics import YOLO
 import urllib.request
 
+os.environ["OPENAI_API_KEY"] = "sk-aitunnel-omeCzGWxkHPU0cPnADKnWe481LTigfBf"
+client = OpenAI()
+
+# --- Генератор заданий через GPT ---
+async def generate_gpt_task():
+    prompt = """
+    Придумай оригинальное задание для спортзала, которое нужно подтвердить фото/видео. Условия:
+    1. Используй конкретный инвентарь (штанга, гантели, тренажеры).
+    2. Укажи детали: вес, ракурс, действие (например, "селфи с гантелей 12 кг в левой руке").
+    3. Задание должно быть в одно предложение.
+    4. Избегай шаблонов. Будь креативным!
+    """
+
+    try:
+        response = client.chat.completions.create(  # Новый синтаксис
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        print(f"Ошибка OpenAI: {e}")
+        return "Селфи с гантелей 12 кг в правой руке."
+
+
+# --- Команда /gym_task ---
+async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task = await generate_gpt_task()
+    await update.message.reply_text(
+        f"🎯 *Ваше задание:*\n\n{task}\n\n"
+        "Отправьте фото/видео для проверки!",
+        parse_mode="Markdown"
+    )
+    context.user_data["current_task"] = task  # Сохраняем задание
 
 # --- Инициализация каскадного классификатора ---
 def init_face_cascade():
@@ -288,6 +325,7 @@ if __name__ == "__main__":
         app.add_handler(CommandHandler("listfaces", list_faces))
         app.add_handler(CommandHandler("renameface", rename_face))
         app.add_handler(CommandHandler("clearfaces", clear_faces))
+        app.add_handler(CommandHandler("gym_task", gym_task))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("Бот запущен...")
