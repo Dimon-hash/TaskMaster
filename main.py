@@ -1,7 +1,11 @@
 import os
 import pickle
 import cv2
+import json
+import base64
+
 from openai import OpenAI
+from PIL import Image
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,77 +19,163 @@ from telegram.ext import (
 from ultralytics import YOLO
 import urllib.request
 
-# os.environ["OPENAI_API_KEY"] = "sk-aitunnel-omeCzGWxkHPU0cPnADKnWe481LTigfBf"
-# client = OpenAI()
+# Инициализация клиента OpenAI
 client = OpenAI(
-    api_key="sk-aitunnel-omeCzGWxkHPU0cPnADKnWe481LTigfBf", # Ключ из нашего сервиса
+    api_key="sk-aitunnel-omeCzGWxkHPU0cPnADKnWe481LTigfBf",
     base_url="https://api.aitunnel.ru/v1/",
 )
+
+# Инициализация YOLO
+model = YOLO("yolov8x.pt")  # Более точная версия YOLO
+
+
 # --- Генератор заданий через GPT ---
 async def generate_gpt_task():
     prompt = """
-    Придумай простое задание для спортзала, которое можно подтвердить фото/видео. Условия:
+    Придумай простое задание для спортзала, которое можно подтвердить фото. Условия:
     1. Используй ОДИН вид инвентаря (штанга, гантели, тренажер).
     2. Укажи только ОДНУ деталь (вес/количество/положение).
     3. Формат: "Сделай [действие] с [инвентарь] + [деталь]".
     4. Избегай сложных формулировок и заданий.
     5. Примеры хороших заданий:
-       - "Селфи с гантелей 10 кг"
+       - "фото гантелей 10 кг"
        - "Фото жима штанги 50 кг"
-       - "Видео 5 приседаний с гирей"
     6. Задание должно быть в одно короткое предложение.
-    7. Избегай шаблонов. Будь креативным!
     """
-
     try:
-        response = client.chat.completions.create(  # Новый синтаксис
-            # model="gpt-4.1-nano",
+        response = client.chat.completions.create(
             model="gpt-4.1",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7
         )
         return response.choices[0].message.content.strip()
-
     except Exception as e:
         print(f"Ошибка OpenAI: {e}")
-        return "Селфи с гантелей 12 кг в правой руке."
+        return "фото гантелей 12 кг в правой руке."
 
+
+# --- Проверка выполнения задания через нейросеть ---
+async def check_task_completion(task_text: str, image_path: str) -> (bool, str):
+    """
+    Проверяет выполнение задания с помощью мультимодальной модели GPT-4o
+    Args:
+        task_text: Текст задания
+        image_path: Путь к изображению для проверки
+    Returns:
+        tuple: (success: bool, explanation: str)
+    """
+    try:
+        # Кодируем изображение в base64
+        with open(image_path, "rb") as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+        # Подготавливаем промпт для анализа
+        system_prompt = """Ты - спортивный тренер. Проверь, соответствует ли фото заданию.
+        Ответь в формате JSON: {"success": bool, "reason": str}"""
+
+        user_prompt = f"""
+        Задание: {task_text}
+        Проверь, соответствует ли изображение этому заданию.
+        Учитывай только:
+        - Наличие нужного инвентаря
+       
+        """
+        # - Соответствие деталей (вес, количество)
+
+
+        # Отправляем изображение и текст в мультимодальную модель
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{encoded_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=300
+        )
+
+        # Парсим ответ
+        result = json.loads(response.choices[0].message.content)
+        return result.get("success", False), result.get("reason", "")
+
+    except Exception as e:
+        print(f"Ошибка при проверке задания: {e}")
+        return False, "Ошибка при анализе изображения"
 
 # --- Команда /gym_task ---
 async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = await generate_gpt_task()
-
-    # Очищаем текст от Markdown-символов
     clean_task = task.replace("*", "").replace("_", "").replace("`", "")
 
     try:
-        # Пытаемся отправить с Markdown
         await update.message.reply_text(
             f"🎯 *Ваше задание:*\n\n{clean_task}\n\n"
             "Отправьте фото/видео для проверки!",
             parse_mode="Markdown"
         )
-    except Exception as e:
-        print(f"Ошибка Markdown: {e}")
-        # Если не получилось, отправляем без разметки
+    except Exception:
         await update.message.reply_text(
             f"🎯 Ваше задание:\n\n{clean_task}\n\n"
             "Отправьте фото/видео для проверки!"
         )
 
-    context.user_data["current_task"] = task
+    context.user_data["current_task"] = clean_task
+
+
+# --- Обработка фото с заданием ---
+async def handle_photo_with_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "current_task" not in context.user_data:
+        await update.message.reply_text("Сначала получите задание через /gym_task")
+        return
+
+    # Сохраняем фото
+    photo_file = await update.message.photo[-1].get_file()
+    photo_path = f"temp_{update.message.message_id}.jpg"
+    await photo_file.download_to_drive(photo_path)
+
+    # Проверяем выполнение
+    task_text = context.user_data["current_task"]
+    success, reason = await check_task_completion(task_text, photo_path)
+
+    # Отправляем результат
+    if success:
+        await update.message.reply_text(
+            f"✅ Задание выполнено правильно!\n"
+            f"Задание: {task_text}\n"
+            f"Причина: {reason}"
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Задание не выполнено!\n"
+            f"Задание: {task_text}\n"
+            f"Причина: {reason}\n\n"
+            f"Попробуйте еще раз!"
+        )
+
+    # Удаляем временный файл
+    os.remove(photo_path)
+
+
 # --- Инициализация каскадного классификатора ---
 def init_face_cascade():
-    # Путь для сохранения каскада
     cascade_path = "haarcascade_frontalface_default.xml"
 
-    # Если файл уже существует
     if os.path.exists(cascade_path):
         classifier = cv2.CascadeClassifier(cascade_path)
         if not classifier.empty():
             return classifier
 
-    # Пробуем найти в пакете opencv
     try:
         opencv_path = os.path.join(cv2.data.haarcascades, cascade_path)
         if os.path.exists(opencv_path):
@@ -95,7 +185,6 @@ def init_face_cascade():
     except Exception:
         pass
 
-    # Если не нашли - скачиваем с GitHub
     try:
         url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
         urllib.request.urlretrieve(url, cascade_path)
@@ -109,10 +198,6 @@ def init_face_cascade():
 
 
 face_cascade = init_face_cascade()
-
-# Инициализация YOLO
-model = YOLO("yolov8l.pt")  # Модель для распознавания тренажеров
-GYM_EQUIPMENT_CLASSES = ["chair", "bench"]
 
 # Настройки для распознавания лиц
 FACE_DATA_DIR = "face_data"
@@ -159,119 +244,30 @@ def draw_faces(image_path, faces, names):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я могу:\n"
-        "1. Распознавать тренажеры на фото (просто отправь фото)\n"
-        "2. Запоминать и распознавать лица (используй /nameface <имя> чтобы назвать лицо)"
+        "1. Давать задания для спортзала (/gym_task)\n"
+        "2. Проверять их выполнение (отправь фото после получения задания)\n"
+        "3. Распознавать лица (/nameface, /listfaces, /renameface)"
     )
 
 
 async def list_faces(update: Update, context: ContextTypes.DEFAULT_TYPE):
     face_db = load_face_database()
-
     if not face_db["names"]:
         await update.message.reply_text("Нет сохраненных лиц.")
         return
 
-    # Формируем список всех имен
-    faces_list = "\n".join(
-        f"{i + 1}. {name}" for i, name in enumerate(face_db["names"])
-    )
-
-    await update.message.reply_text(
-        "Сохраненные лица:\n" + faces_list,
-        parse_mode='Markdown'
-    )
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        # Скачиваем фото
-        photo_file = await update.message.photo[-1].get_file()
-        photo_path = f"temp_{update.message.message_id}.jpg"
-        await photo_file.download_to_drive(photo_path)
-
-        # Проверяем на тренажеры
-        results = model(photo_path)
-        class_name_pr = ""
-        found_equipment = False
-
-        for result in results:
-            for box in result.boxes:
-                class_name = result.names[int(box.cls)]
-                class_name_pr += class_name + " "
-                if class_name in GYM_EQUIPMENT_CLASSES:
-                    found_equipment = True
-
-        # Проверяем на лица с помощью OpenCV
-        face_message = ""
-        if face_cascade is not None:
-            try:
-                image = cv2.imread(photo_path)
-                if image is None:
-                    raise ValueError("Не удалось загрузить изображение")
-
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-
-                if len(faces) > 0:
-                    face_db = load_face_database()
-                    recognized_names = []
-
-                    for (x, y, w, h) in faces:
-                        features = extract_face_features(gray, (x, y, w, h))
-                        name = "Unknown"
-
-                        for i, db_features in enumerate(face_db["features"]):
-                            if compare_faces(features, db_features):
-                                name = face_db["names"][i]
-                                break
-
-                        if name == "Unknown":
-                            name = f"User_{update.message.from_user.id}_{len(face_db['features'])}"
-                            face_db["features"].append(features)
-                            face_db["names"].append(name)
-                            save_face_database(face_db)
-
-                        recognized_names.append(name)
-
-                    output_path = draw_faces(photo_path, faces, recognized_names)
-                    await update.message.reply_photo(
-                        photo=open(output_path, "rb"),
-                        caption=f"Распознанные лица: {', '.join(recognized_names)}"
-                    )
-                    os.remove(output_path)
-                    face_message = f"\n\nНайдены лица: {', '.join(recognized_names)}"
-                else:
-                    face_message = "\n\nЛица не обнаружены."
-            except Exception as e:
-                print(f"Ошибка при обработке лиц: {e}")
-                face_message = "\n\nОшибка при распознавании лиц."
-        else:
-            face_message = "\n\nРаспознавание лиц недоступно (классификатор не загружен)."
-
-        # Отправляем результат
-        response = f"{'✅ Да' if found_equipment else '❌ Нет'}, на фото {'есть тренажёр' if found_equipment else 'не обнаружено тренажёров'}! {class_name_pr}{face_message}"
-        await update.message.reply_text(response)
-
-    except Exception as e:
-        print(f"Ошибка при обработке фото: {e}")
-        await update.message.reply_text("Произошла ошибка при обработке фото. Пожалуйста, попробуйте еще раз.")
-    finally:
-        if os.path.exists(photo_path):
-            os.remove(photo_path)
+    faces_list = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(face_db["names"]))
+    await update.message.reply_text("Сохраненные лица:\n" + faces_list)
 
 
 async def rename_face(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text(
-            "Использование: /renameface <номер> <новое_имя>\n"
-            "Пример: /renameface 2 NewName\n\n"
-            "Сначала посмотрите номера лиц через /listfaces"
-        )
+        await update.message.reply_text("Использование: /renameface <номер> <новое_имя>")
         return
 
     try:
-        face_num = int(context.args[0]) - 1  # Переводим в 0-based индекс
+        face_num = int(context.args[0]) - 1
         new_name = ' '.join(context.args[1:])
-
         face_db = load_face_database()
 
         if face_num < 0 or face_num >= len(face_db["names"]):
@@ -282,12 +278,7 @@ async def rename_face(update: Update, context: ContextTypes.DEFAULT_TYPE):
         face_db["names"][face_num] = new_name
         save_face_database(face_db)
 
-        await update.message.reply_text(
-            f"Лицо успешно переименовано:\n"
-            f"Было: {old_name}\n"
-            f"Стало: {new_name}"
-        )
-
+        await update.message.reply_text(f"Лицо успешно переименовано:\nБыло: {old_name}\nСтало: {new_name}")
     except ValueError:
         await update.message.reply_text("Номер должен быть целым числом!")
     except Exception as e:
@@ -295,17 +286,12 @@ async def rename_face(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear_faces(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Подтверждение через клавиатуру
     keyboard = [
         [InlineKeyboardButton("Да, очистить", callback_data="clear_confirm")],
         [InlineKeyboardButton("Отмена", callback_data="clear_cancel")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "Вы уверены, что хотите удалить ВСЕ сохранённые лица?",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text("Вы уверены, что хотите удалить ВСЕ сохранённые лица?", reply_markup=reply_markup)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -313,13 +299,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "clear_confirm":
-        # Создаём новую чистую базу
         new_db = {"features": [], "names": []}
         save_face_database(new_db)
-
         await query.edit_message_text("✅ Все лица успешно удалены!")
     elif query.data == "clear_cancel":
         await query.edit_message_text("❌ Удаление отменено")
+
 
 async def name_face(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -338,17 +323,17 @@ async def name_face(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    TOKEN = "8006388827:AAGg4xPDWHjQ8aaS30-fSy97YK7jBUUabgQ"  # Замените на ваш реальный токен
+    TOKEN = "8006388827:AAGg4xPDWHjQ8aaS30-fSy97YK7jBUUabgQ"
     try:
         app = Application.builder().token(TOKEN).build()
 
-        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("gym_task", gym_task))
+        app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo_with_task))
         app.add_handler(CommandHandler("nameface", name_face))
         app.add_handler(CommandHandler("listfaces", list_faces))
         app.add_handler(CommandHandler("renameface", rename_face))
         app.add_handler(CommandHandler("clearfaces", clear_faces))
-        app.add_handler(CommandHandler("gym_task", gym_task))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("Бот запущен...")
