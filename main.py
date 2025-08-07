@@ -6,6 +6,7 @@ import base64
 import asyncio
 import asyncpg
 import logging
+import numpy as np
 from pathlib import Path
 
 from openai import OpenAI
@@ -143,7 +144,7 @@ class TaskGenerator:
             return response.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"Ошибка OpenAI: {e}")
-            return "фото гантелей 12 кг в правой руке."
+            return "фото гантелей  в правой руке."
 
 
 # Работа с изображениями
@@ -159,7 +160,7 @@ class ImageProcessor:
         gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
         normalized = gray / 255.0  # Нормализация
 
-        return normalized.flatten()
+        return normalized.flatten().tolist()
 
     @staticmethod
     async def extract_face_from_photo(image_path):
@@ -181,8 +182,18 @@ class ImageProcessor:
 
     @staticmethod
     def compare_faces(features1, features2, threshold=0.7):
+        """
+        Сравнивает два вектора признаков лиц и возвращает True, если они похожи.
+
+        Параметры:
+            features1 (np.array/list): Вектор признаков первого лица
+            features2 (np.array/list): Вектор признаков второго лица
+            threshold (float): Порог схожести (0-1)
+
+        Возвращает:
+            bool: True если лица совпадают, иначе False
+        """
         try:
-            import numpy as np
 
             # Проверка входных данных
             if features1 is None or features2 is None:
@@ -192,15 +203,19 @@ class ImageProcessor:
             arr1 = np.array(features1, dtype=np.float32)
             arr2 = np.array(features2, dtype=np.float32)
 
-            # Нормализация массивов
+            # Проверка размерности векторов
+            if arr1.shape != arr2.shape:
+                return False
+
+            # Нормализация векторов
             arr1 = arr1 / np.linalg.norm(arr1)
             arr2 = arr2 / np.linalg.norm(arr2)
 
-            # Вычисляем косинусное сходство (более надежно, чем MSE)
-            similarity = np.dot(arr1, arr2) / (np.linalg.norm(arr1) * np.linalg.norm(arr2))
+            # Вычисление косинусного сходства
+            similarity = np.dot(arr1, arr2)
 
-            # Сравниваем с порогом
-            return similarity > threshold
+            # Сравнение с порогом
+            return similarity >= threshold
 
         except Exception as e:
             logger.error(f"Ошибка сравнения лиц: {e}")
@@ -432,6 +447,7 @@ class BotHandlers:
             )
 
             result = json.loads(response.choices[0].message.content)
+
             if not result.get("success", False):
                 return False, result.get("reason", "Задание не выполнено")
 
@@ -516,6 +532,7 @@ async def main():
             app.add_handler(handler)
 
         logger.info("Бот запущен")
+
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
