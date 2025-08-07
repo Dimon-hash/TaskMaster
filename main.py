@@ -6,6 +6,7 @@ import base64
 import asyncio
 import asyncpg
 import logging
+
 import numpy as np
 from pathlib import Path
 
@@ -559,3 +560,4 @@ if __name__ == "__main__":
         logger.info("Бот остановлен пользователем")
     except Exception as e:
         logger.critical(f"Фатальная ошибка: {e}")
+
