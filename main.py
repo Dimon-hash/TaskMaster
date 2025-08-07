@@ -16,7 +16,7 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler
 )
-from ultralytics import YOLO
+
 import urllib.request
 
 # Инициализация клиента OpenAI
@@ -25,8 +25,6 @@ client = OpenAI(
     base_url="https://api.aitunnel.ru/v1/",
 )
 
-# Инициализация YOLO
-model = YOLO("yolov8x.pt")  # Более точная версия YOLO
 
 
 # --- Генератор заданий через GPT ---
@@ -41,6 +39,8 @@ async def generate_gpt_task():
        - "фото гантелей 10 кг"
        - "Фото жима штанги 50 кг"
     6. Задание должно быть в одно короткое предложение.
+    7. Сделай понятное задание
+
     """
     try:
         response = client.chat.completions.create(
@@ -70,16 +70,7 @@ async def check_task_completion(task_text: str, image_path: str) -> (bool, str):
             encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
 
         # Подготавливаем промпт для анализа
-        system_prompt = """Ты - спортивный тренер. Проверь, соответствует ли фото заданию.
-        Ответь в формате JSON: {"success": bool, "reason": str}"""
-
-        user_prompt = f"""
-        Задание: {task_text}
-        Проверь, соответствует ли изображение этому заданию.
-        Учитывай только:
-        - Наличие нужного инвентаря
-       
-        """
+       ,
         # - Соответствие деталей (вес, количество)
 
 
