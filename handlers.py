@@ -15,10 +15,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with (await Database.acquire()) as conn:
         exists = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user.id)
     if not exists:
-        await update.message.reply_text("Добро пожаловать! Отправьте селфи для регистрации.")
+        await update.message.reply_text("👋 Добро пожаловать! Отправьте селфи 📸 для регистрации.")
         context.user_data["awaiting_face"] = True
     else:
-        await update.message.reply_text("Вы уже зарегистрированы. Используйте /gym_task")
+        await update.message.reply_text("ℹ️ Вы уже зарегистрированы. Используйте /gym_task 💪")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -26,7 +26,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await handle_registration_photo(update, context)
     if context.user_data.get("current_task"):
         return await handle_task_photo(update, context)
-    await update.message.reply_text("Неизвестный контекст. Используйте /start или /gym_task")
+    await update.message.reply_text("⚠️ Неизвестный контекст. Используйте /start или /gym_task")
 
 
 async def handle_registration_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -37,13 +37,13 @@ async def handle_registration_photo(update: Update, context: ContextTypes.DEFAUL
     await photo_file.download_to_drive(path)
 
     if path.stat().st_size > settings.MAX_PHOTO_SIZE:
-        await update.message.reply_text("Фото слишком большое.")
+        await update.message.reply_text("⚠️ Фото слишком большое.")
         path.unlink(missing_ok=True)
         return
 
     features = await extract_face_from_photo(path)
     if features is None:
-        await update.message.reply_text("Лицо не найдено. Попробуйте другое фото.")
+        await update.message.reply_text("😕 Лицо не найдено. Попробуйте другое фото.")
         path.unlink(missing_ok=True)
         return
 
@@ -62,7 +62,7 @@ async def handle_registration_photo(update: Update, context: ContextTypes.DEFAUL
         )
 
     context.user_data["awaiting_face"] = False
-    await update.message.reply_text("Регистрация завершена!")
+    await update.message.reply_text("✅ Регистрация завершена! 🎉")
     path.unlink(missing_ok=True)
 
 async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -70,7 +70,7 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     task_id = context.user_data.get("current_task_id")
     if not task_id:
-        await update.message.reply_text("Нет активного задания.")
+        await update.message.reply_text("⚠️ Нет активного задания.")
         return
 
     # Скачиваем фото пользователя
@@ -85,7 +85,7 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1️⃣ Извлекаем лицо с присланного фото
     features = await extract_face_from_photo(path)
     if features is None:
-        await update.message.reply_text("Лицо не найдено. Попробуйте другое фото.")
+        await update.message.reply_text("😕 Лицо не найдено. Попробуйте другое фото.")
         path.unlink(missing_ok=True)
         return
 
@@ -96,7 +96,7 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if stored_features_bytes is None:
-        await update.message.reply_text("Ваша регистрация повреждена — нет данных лица.")
+        await update.message.reply_text("⚠️ Ваша регистрация повреждена — нет данных лица.")
         path.unlink(missing_ok=True)
         return
 
@@ -110,7 +110,7 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         is_match, similarity_score = is_match_result, None
 
-    await update.message.reply_text(f"Совпадение: {is_match}, коэффициент: {similarity_score}")
+    await update.message.reply_text(f"🎯 Совпадение: {is_match}, коэффициент: {similarity_score}")
 
     if not is_match:
         await update.message.reply_text("❌ Лицо не совпадает с регистрационным фото.")
@@ -142,7 +142,7 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["current_task"] = None
     context.user_data["current_task_id"] = None
 
-    await update.message.reply_text("✅ Задание выполнено и проверено!")
+    await update.message.reply_text("✅ Задание выполнено и проверено! 🏆")
     path.unlink(missing_ok=True)
 
 
@@ -151,7 +151,7 @@ async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with (await Database.acquire()) as conn:
         registered = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user.id)
     if not registered:
-        await update.message.reply_text("Вы не зарегистрированы. Используйте /start")
+        await update.message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
         return
 
     task = await generate_gpt_task()
@@ -165,7 +165,7 @@ async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["current_task"] = task
     context.user_data["current_task_id"] = task_id
 
-    await update.message.reply_text(f"Задание: {task}\nОтправьте фото для проверки.")
+    await update.message.reply_text(f"📋 Задание: {task}\n📸 Отправьте фото для проверки.")
 
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,7 +182,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, user.id)
 
     if not stats:
-        await update.message.reply_text("Вы не зарегистрированы. Используйте /start")
+        await update.message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
         return
 
     total = stats['total_tasks'] or 0
@@ -190,8 +190,8 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     percent = (comp / total * 100) if total else 0
 
     await update.message.reply_text(
-        f"Выполнено: {comp}/{total} ({percent:.0f}%)\n"
-        f"Зарегистрирован: {stats['registration_date'].strftime('%d.%m.%Y')}"
+        f"📊 Выполнено: {comp}/{total} ({percent:.0f}%)\n"
+        f"🗓️ Зарегистрирован: {stats['registration_date'].strftime('%d.%m.%Y')}"
     )
 
 
@@ -203,7 +203,7 @@ async def send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if not photo_bytes:
-        await update.message.reply_text("Фото не найдено. Вы ещё не регистрировались.")
+        await update.message.reply_text("⚠️ Фото не найдено. Вы ещё не регистрировались.")
         return
 
     await update.message.reply_photo(
