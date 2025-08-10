@@ -1,0 +1,42 @@
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: linear-gradient(135deg, #f5f7fa, #c3cfe2);
+  color: #333;
+}
+
+header {
+  background: #4CAF50;
+  color: #fff;
+  padding: 20px;
+  text-align: center;
+}
+
+.hero {
+  text-align: center;
+  padding: 40px 20px;
+}
+
+.features {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 20px;
+  padding: 20px;
+}
+
+.card {
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  padding: 20px;
+  width: 280px;
+  text-align: center;
+}
+
+footer {
+  background: #4CAF50;
+  color: #fff;
+  text-align: center;
+  padding: 10px;
+}
