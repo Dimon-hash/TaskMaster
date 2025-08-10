@@ -1,0 +1,18 @@
+from pydantic_settings import BaseSettings
+from pydantic import AnyUrl
+from pathlib import Path
+
+class Settings(BaseSettings):
+    TELEGRAM_TOKEN: str
+    DATABASE_URL: AnyUrl
+    OPENAI_API_KEY: str
+    OPENAI_BASE_URL: AnyUrl
+    TEMP_DIR: Path = Path("temp")
+    MAX_PHOTO_SIZE: int = 5 * 1024 * 1024
+
+    class Config:
+        env_file = ".env.TaskMaster"
+        env_file_encoding = "utf-8"
+
+settings = Settings()
+settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
