@@ -12,24 +12,23 @@ client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url=str(settings.OPENAI_BA
 
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=3)
-async def generate_gpt_task():
+async def generate_gpt_task(program: str | None = None) -> str:
     """Генерирует короткое задание для спортзала, подтверждаемое фото."""
-    prompt = (
-        """
-        Придумай простое задание для спортзала, которое можно подтвердить фото.
-        Условия:
-        1. Один вид инвентаря.
-        2. Только одна деталь .
-        3. Формат: "Сделай [действие] с [инвентарь] + [деталь]".
-        4. Избегай сложных формулировок.
-        5. Примеры:
-           - "Фото гантелей"
-           - "Фото жима штанги"
-        6. Одно короткое предложение.
-        """
-    )
-    if training_program:
-        prompt += f"\nУчитывай программу тренировок пользователя: {training_program}."
+    prompt = """
+Придумай простое задание для спортзала, которое можно подтвердить фото.
+Условия:
+1. Один вид инвентаря.
+2. Только одна деталь.
+3. Формат: "Сделай [действие] с [инвентарь] + [деталь]".
+4. Избегай сложных формулировок.
+5. Примеры:
+   - "Фото гантелей"
+   - "Фото жима штанги"
+6. Одно короткое предложение.
+"""
+    if program:
+        prompt += f"\nУчитывай программу тренировок пользователя: {program}"
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1",
@@ -54,12 +53,10 @@ async def verify_task_with_gpt(task_text: str, image_path: str | Path) -> dict:
         if not image_path.exists():
             raise FileNotFoundError(f"Файл {image_path} не найден.")
 
-        # Определяем MIME-тип (по расширению файла)
         mime_type, _ = mimetypes.guess_type(image_path)
         if mime_type not in {"image/jpeg", "image/png"}:
             raise ValueError(f"Неподдерживаемый формат файла: {mime_type}")
 
-        # Кодируем фото в base64
         with open(image_path, "rb") as f:
             base64_image = base64.b64encode(f.read()).decode("utf-8")
 
@@ -70,12 +67,10 @@ async def verify_task_with_gpt(task_text: str, image_path: str | Path) -> dict:
                     {
                         "type": "text",
                         "text": (
-                            "Ты спортивный тренер. Твоя задача — проверить, соответствует ли фото заданию "
-                            "и действительно ли оно сделано вживую, а не смонтировано. "
-                            "Фото должно быть оригинальным, без признаков монтажа, подмены лица, "
-                            "использования чужого изображения, экрана телефона или монитора. "
-                            "Ответ верни строго в формате JSON: {\"success\": bool, \"reason\": string}."
-                           )
+                            'Ты спортивный тренер. Проверь, соответствует ли фото заданию и сделано ли оно вживую. '
+                            'Запрещены монтаж/подмена лица/фото экрана. '
+                            'Ответ строго JSON: {"success": bool, "reason": string}.'
+                        )
                     }
                 ]
             },
@@ -97,7 +92,6 @@ async def verify_task_with_gpt(task_text: str, image_path: str | Path) -> dict:
 
         result_text = resp.choices[0].message.content.strip()
 
-        # Пробуем распарсить JSON
         try:
             return json.loads(result_text)
         except json.JSONDecodeError:
