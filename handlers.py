@@ -202,33 +202,54 @@ async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
     user = update.effective_user
+
     async with Database.acquire() as conn:
-        stats = await conn.fetchrow(
+        # 1) проверим, что юзер есть, и заберём фото+дату
+        urow = await conn.fetchrow(
+            "SELECT face_photo, registration_date FROM users WHERE user_id = $1",
+            user.id
+        )
+
+        if not urow:
+            await message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
+            return
+
+        # 2) агрегаты по задачам
+        trow = await conn.fetchrow(
             """
-            SELECT COUNT(t.task_id) AS total_tasks,
-                   SUM(CASE WHEN t.status='completed' THEN 1 ELSE 0 END) AS completed_tasks,
-                   u.registration_date
-            FROM users u
-            LEFT JOIN tasks t ON u.user_id = t.user_id
-            WHERE u.user_id = $1
-            GROUP BY u.user_id
+            SELECT
+                COUNT(*) AS total_tasks,
+                COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_tasks
+            FROM tasks
+            WHERE user_id = $1
             """,
             user.id
         )
 
-    if not stats:
-        await message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
-        return
-
-    total = stats['total_tasks'] or 0
-    comp = stats['completed_tasks'] or 0
+    total = int(trow["total_tasks"] or 0)
+    comp = int(trow["completed_tasks"] or 0)
     percent = (comp / total * 100) if total else 0
 
-    await message.reply_text(
+    caption = (
         f"📊 Выполнено: {comp}/{total} ({percent:.0f}%)\n"
-        f"🗓️ Зарегистрирован: {stats['registration_date'].strftime('%d.%m.%Y')}",
-        reply_markup=main_keyboard(),
+        f"🗓️ Зарегистрирован: {urow['registration_date'].strftime('%d.%m.%Y')}"
+        if urow.get("registration_date") else
+        f"📊 Выполнено: {comp}/{total} ({percent:.0f}%)"
     )
+
+    photo_bytes = urow.get("face_photo")
+    if photo_bytes:
+        await message.reply_photo(
+            photo=photo_bytes,
+            caption=caption,
+            reply_markup=main_keyboard(),
+        )
+    else:
+        await message.reply_text(
+            caption,
+            reply_markup=main_keyboard(),
+        )
+
 
 async def delete_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
