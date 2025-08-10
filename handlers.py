@@ -1,6 +1,6 @@
 import logging
 import pickle
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from database import Database
 from image_processor import extract_face_from_photo, compare_faces
@@ -9,17 +9,26 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏋️ Получить задание", callback_data="gym_task")],
+        [InlineKeyboardButton("📊 Профиль", callback_data="profile")],
+    ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     async with (await Database.acquire()) as conn:
         exists = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user.id)
     if not exists:
-        await update.message.reply_text("👋 Добро пожаловать! Отправьте селфи 📸 для регистрации.")
+        await update.message.reply_text(
+            "👋 Добро пожаловать! Отправьте селфи 📸 для регистрации."
+        )
         context.user_data["awaiting_face"] = True
     else:
-        await update.message.reply_text("ℹ️ Вы уже зарегистрированы. Используйте /gym_task 💪")
-
+        await update.message.reply_text(
+            "ℹ️ Вы уже зарегистрированы. Используйте меню ниже 💪",
+            reply_markup=main_menu(),
+        )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("awaiting_face"):
@@ -27,7 +36,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("current_task"):
         return await handle_task_photo(update, context)
     await update.message.reply_text("⚠️ Неизвестный контекст. Используйте /start или /gym_task")
-
 
 async def handle_registration_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка фото при регистрации"""
@@ -62,7 +70,9 @@ async def handle_registration_photo(update: Update, context: ContextTypes.DEFAUL
         )
 
     context.user_data["awaiting_face"] = False
-    await update.message.reply_text("✅ Регистрация завершена! 🎉")
+    await update.message.reply_text(
+        "✅ Регистрация завершена! 🎉", reply_markup=main_menu()
+    )
     path.unlink(missing_ok=True)
 
 async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -73,23 +83,19 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Нет активного задания.")
         return
 
-    # Скачиваем фото пользователя
     photo_file = await update.message.photo[-1].get_file()
     path = settings.TEMP_DIR / f"task_{user.id}.jpg"
     await photo_file.download_to_drive(path)
 
-    # Читаем файл в байты
     with open(path, 'rb') as f:
         photo_bytes = f.read()
 
-    # 1️⃣ Извлекаем лицо с присланного фото
     features = await extract_face_from_photo(path)
     if features is None:
         await update.message.reply_text("😕 Лицо не найдено. Попробуйте другое фото.")
         path.unlink(missing_ok=True)
         return
 
-    # 2️⃣ Получаем сохранённые при регистрации фичи
     async with (await Database.acquire()) as conn:
         stored_features_bytes = await conn.fetchval(
             "SELECT face_features FROM users WHERE user_id = $1", user.id
@@ -101,10 +107,7 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     stored_features = pickle.loads(stored_features_bytes)
-
-    # 3️⃣ Сравниваем лица
     is_match_result = compare_faces(stored_features, features)
-
     if isinstance(is_match_result, (list, tuple)):
         is_match, similarity_score = is_match_result
     else:
@@ -117,10 +120,8 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path.unlink(missing_ok=True)
         return
 
-    # 4️⃣ Проверяем выполнение задания через GPT
     task_text = context.user_data.get("current_task")
     gpt_result = await verify_task_with_gpt(task_text, str(path))
-    # await update.message.reply_text(gpt_check)
 
     if not gpt_result.get("success", False):
         reason = gpt_result.get("reason", "Проверка не пройдена.")
@@ -128,7 +129,6 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path.unlink(missing_ok=True)
         return
 
-    # 5️⃣ Сохраняем результат в БД
     async with (await Database.acquire()) as conn:
         await conn.execute("""
             UPDATE tasks
@@ -138,20 +138,21 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WHERE task_id = $2
         """, photo_bytes, task_id)
 
-    # 6️⃣ Очищаем контекст
     context.user_data["current_task"] = None
     context.user_data["current_task_id"] = None
 
-    await update.message.reply_text("✅ Задание выполнено и проверено! 🏆")
+    await update.message.reply_text(
+        "✅ Задание выполнено и проверено! 🏆", reply_markup=main_menu()
+    )
     path.unlink(missing_ok=True)
 
-
 async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message or update.callback_query.message
     user = update.effective_user
     async with (await Database.acquire()) as conn:
         registered = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user.id)
     if not registered:
-        await update.message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
+        await message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
         return
 
     task = await generate_gpt_task()
@@ -165,10 +166,12 @@ async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["current_task"] = task
     context.user_data["current_task_id"] = task_id
 
-    await update.message.reply_text(f"📋 Задание: {task}\n📸 Отправьте фото для проверки.")
-
+    await message.reply_text(
+        f"📋 Задание: {task}\n📸 Отправьте фото для проверки."
+    )
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message or update.callback_query.message
     user = update.effective_user
     async with (await Database.acquire()) as conn:
         stats = await conn.fetchrow("""
@@ -182,18 +185,26 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, user.id)
 
     if not stats:
-        await update.message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
+        await message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
         return
 
     total = stats['total_tasks'] or 0
     comp = stats['completed_tasks'] or 0
     percent = (comp / total * 100) if total else 0
 
-    await update.message.reply_text(
+    await message.reply_text(
         f"📊 Выполнено: {comp}/{total} ({percent:.0f}%)\n"
-        f"🗓️ Зарегистрирован: {stats['registration_date'].strftime('%d.%m.%Y')}"
+        f"🗓️ Зарегистрирован: {stats['registration_date'].strftime('%d.%m.%Y')}",
+        reply_markup=main_menu(),
     )
 
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "gym_task":
+        await gym_task(update, context)
+    elif query.data == "profile":
+        await profile(update, context)
 
 async def send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
