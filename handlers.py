@@ -1,6 +1,6 @@
 import logging
 import pickle
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ContextTypes
 from database import Database
 from image_processor import extract_face_from_photo, compare_faces
@@ -9,11 +9,12 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏋️ Получить задание", callback_data="gym_task")],
-        [InlineKeyboardButton("📊 Профиль", callback_data="profile")],
-    ])
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🏋️ Получить задание"), KeyboardButton("📊 Профиль")]],
+        resize_keyboard=True,
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -27,7 +28,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "ℹ️ Вы уже зарегистрированы. Используйте меню ниже 💪",
-            reply_markup=main_menu(),
+            reply_markup=main_keyboard(),
         )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -71,7 +72,7 @@ async def handle_registration_photo(update: Update, context: ContextTypes.DEFAUL
 
     context.user_data["awaiting_face"] = False
     await update.message.reply_text(
-        "✅ Регистрация завершена! 🎉", reply_markup=main_menu()
+        "✅ Регистрация завершена! 🎉", reply_markup=main_keyboard()
     )
     path.unlink(missing_ok=True)
 
@@ -142,7 +143,7 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["current_task_id"] = None
 
     await update.message.reply_text(
-        "✅ Задание выполнено и проверено! 🏆", reply_markup=main_menu()
+        "✅ Задание выполнено и проверено! 🏆", reply_markup=main_keyboard()
     )
     path.unlink(missing_ok=True)
 
@@ -167,7 +168,8 @@ async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["current_task_id"] = task_id
 
     await message.reply_text(
-        f"📋 Задание: {task}\n📸 Отправьте фото для проверки."
+        f"📋 Задание: {task}\n📸 Отправьте фото для проверки.",
+        reply_markup=main_keyboard(),
     )
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -195,16 +197,8 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(
         f"📊 Выполнено: {comp}/{total} ({percent:.0f}%)\n"
         f"🗓️ Зарегистрирован: {stats['registration_date'].strftime('%d.%m.%Y')}",
-        reply_markup=main_menu(),
+        reply_markup=main_keyboard(),
     )
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "gym_task":
-        await gym_task(update, context)
-    elif query.data == "profile":
-        await profile(update, context)
 
 async def send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user

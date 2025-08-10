@@ -1,11 +1,9 @@
 import asyncio
 import logging
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
 from config import settings
@@ -24,8 +22,9 @@ async def main():
     app.add_handler(CommandHandler('gym_task', handlers.gym_task))
     app.add_handler(CommandHandler('profile', handlers.profile))
     app.add_handler(CommandHandler('sendphoto', handlers.send_photo))
+    app.add_handler(MessageHandler(filters.Regex("^🏋️ Получить задание$"), handlers.gym_task))
+    app.add_handler(MessageHandler(filters.Regex("^📊 Профиль$"), handlers.profile))
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handlers.handle_photo))
-    app.add_handler(CallbackQueryHandler(handlers.menu_callback))
 
     logger.info('Бот запускается...')
     await app.initialize()
