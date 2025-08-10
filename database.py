@@ -21,6 +21,7 @@ class Database:
                         last_name TEXT,
                         face_features BYTEA,
                         face_photo BYTEA,
+                        training_program TEXT,
                         registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)

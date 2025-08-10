@@ -19,12 +19,17 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     async with (await Database.acquire()) as conn:
-        exists = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user.id)
-    if not exists:
+        user_row = await conn.fetchrow("SELECT training_program FROM users WHERE user_id = $1", user.id)
+    if not user_row:
         await update.message.reply_text(
             "👋 Добро пожаловать! Отправьте селфи 📸 для регистрации."
         )
         context.user_data["awaiting_face"] = True
+    elif not user_row["training_program"]:
+        await update.message.reply_text(
+            "✍️ Расскажите о своей программе тренировок или целях."
+        )
+        context.user_data["awaiting_program"] = True
     else:
         await update.message.reply_text(
             "ℹ️ Вы уже зарегистрированы. Используйте меню ниже 💪",
@@ -71,8 +76,9 @@ async def handle_registration_photo(update: Update, context: ContextTypes.DEFAUL
         )
 
     context.user_data["awaiting_face"] = False
+    context.user_data["awaiting_program"] = True
     await update.message.reply_text(
-        "✅ Регистрация завершена! 🎉", reply_markup=main_keyboard()
+        "📋 Опишите вашу программу тренировок или цели. Это поможет подбирать задания.",
     )
     path.unlink(missing_ok=True)
 
@@ -98,26 +104,6 @@ async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with (await Database.acquire()) as conn:
-        stored_features_bytes = await conn.fetchval(
-            "SELECT face_features FROM users WHERE user_id = $1", user.id
-        )
-
-    if stored_features_bytes is None:
-        await update.message.reply_text("⚠️ Ваша регистрация повреждена — нет данных лица.")
-        path.unlink(missing_ok=True)
-        return
-
-    stored_features = pickle.loads(stored_features_bytes)
-    is_match_result = compare_faces(stored_features, features)
-    if isinstance(is_match_result, (list, tuple)):
-        is_match, similarity_score = is_match_result
-    else:
-        is_match, similarity_score = is_match_result, None
-
-    await update.message.reply_text(f"🎯 Совпадение: {is_match}, коэффициент: {similarity_score}")
-
-    if not is_match:
-        await update.message.reply_text("❌ Лицо не совпадает с регистрационным фото.")
         path.unlink(missing_ok=True)
         return
 
@@ -151,12 +137,19 @@ async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
     user = update.effective_user
     async with (await Database.acquire()) as conn:
-        registered = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user.id)
-    if not registered:
+        user_row = await conn.fetchrow("SELECT training_program FROM users WHERE user_id = $1", user.id)
+    if not user_row:
         await message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
         return
+    training_program = user_row["training_program"]
+    if not training_program:
+        await message.reply_text(
+            "✍️ Сначала расскажите о своей программе тренировок. Отправьте текст.",
+        )
+        context.user_data["awaiting_program"] = True
+        return
 
-    task = await generate_gpt_task()
+    task = await generate_gpt_task(training_program)
     async with (await Database.acquire()) as conn:
         task_id = await conn.fetchval("""
             INSERT INTO tasks (user_id, task_text, status)
@@ -215,3 +208,21 @@ async def send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo=photo_bytes,
         caption="Ваше сохранённое фото для идентификации"
     )
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_program"):
+        program = update.message.text.strip()
+        async with (await Database.acquire()) as conn:
+            await conn.execute(
+                "UPDATE users SET training_program=$1 WHERE user_id=$2",
+                program,
+                update.effective_user.id,
+            )
+        context.user_data["awaiting_program"] = False
+        await update.message.reply_text(
+            "✅ Программа сохранена!", reply_markup=main_keyboard()
+        )
+        return
+    await update.message.reply_text(
+        "⚠️ Неизвестный текст. Используйте меню или команды."
+    )
+

@@ -28,6 +28,8 @@ async def generate_gpt_task():
         6. Одно короткое предложение.
         """
     )
+    if training_program:
+        prompt += f"\nУчитывай программу тренировок пользователя: {training_program}."
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1",
