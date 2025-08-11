@@ -7,14 +7,33 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# В рантайме работаем без пула (одноразовые соединения) — стабильно на Windows/Py3.12.
+USE_POOL_FOR_RUNTIME = False
+
+
+class _DirectConn:
+    """Контекст-менеджер одноразового соединения (без пула)."""
+    def __init__(self, dsn: str):
+        self._dsn = dsn
+        self._conn: Optional[asyncpg.Connection] = None
+
+    async def __aenter__(self) -> asyncpg.Connection:
+        self._conn = await asyncpg.connect(dsn=self._dsn)
+        await self._conn.execute("SET search_path TO public")
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._conn:
+            await self._conn.close()
+            self._conn = None
+
 
 class Database:
     """
-    Обертка над asyncpg-пулом:
-      - init() — создаёт пул и схему БД (таблицы/миграции)
-      - acquire() — синхронный метод, возвращает КОНТЕКСТ-МЕНЕДЖЕР пула (!!!)
-      - truncate_all() — очистка данных (TRUNCATE)
-      - drop_all() — удаление таблиц (DROP)
+    Обёртка над БД:
+      - init() — создаёт пул и применяет схему/миграции
+      - acquire() — в safe-режиме возвращает одноразовое соединение (без пула)
+      - truncate_all()/drop_all() — разрушающие операции на отдельном соединении
       - close() — закрыть пул
     """
     pool: Optional[asyncpg.pool.Pool] = None
@@ -29,7 +48,6 @@ class Database:
 
         cls.pool = await asyncpg.create_pool(dsn=str(settings.DATABASE_URL))
         async with cls.pool.acquire() as conn:
-            # На всякий случай фиксируем search_path на public
             await conn.execute("SET search_path TO public")
 
             # Базовые таблицы
@@ -68,36 +86,40 @@ class Database:
     @classmethod
     def acquire(cls):
         """
-        ВАЖНО: НЕ async!
-        Возвращает контекст-менеджер пула. Использование:
-            async with Database.acquire() as conn:
-                await conn.fetchval("SELECT 1")
+        Возвращает контекст-менеджер соединения.
+        В safe-режиме — одноразовое подключение (без пула).
+        Если нужен пул — выстави USE_POOL_FOR_RUNTIME = True.
         """
+        dsn = str(settings.DATABASE_URL)
+        if not USE_POOL_FOR_RUNTIME:
+            return _DirectConn(dsn)
+
         if cls.pool is None:
             raise RuntimeError("Pool is not initialized. Call Database.init() first.")
         return cls.pool.acquire()
 
     @classmethod
     async def truncate_all(cls) -> None:
-        """Очищает данные, оставляет структуру (сброс identity)."""
-        if cls.pool is None:
-            await cls.init()
-        async with cls.pool.acquire() as conn:
+        """Очищает данные, оставляет структуру (сброс identity). Отдельное соединение, не из пула."""
+        conn = await asyncpg.connect(dsn=str(settings.DATABASE_URL))
+        try:
             await conn.execute("SET search_path TO public")
-            # порядок: сначала зависимые таблицы
             await conn.execute("TRUNCATE TABLE public.tasks, public.users RESTART IDENTITY CASCADE")
-        logger.info("All tables truncated (users/tasks).")
+            logger.info("All tables truncated (users/tasks).")
+        finally:
+            await conn.close()
 
     @classmethod
     async def drop_all(cls) -> None:
-        """Удаляет таблицы. После перезапуска init() создаст их снова."""
-        if cls.pool is None:
-            await cls.init()
-        async with cls.pool.acquire() as conn:
+        """Удаляет таблицы. Отдельное соединение, чтобы не ловить reset на release()."""
+        conn = await asyncpg.connect(dsn=str(settings.DATABASE_URL))
+        try:
             await conn.execute("SET search_path TO public")
             await conn.execute("DROP TABLE IF EXISTS public.tasks CASCADE")
             await conn.execute("DROP TABLE IF EXISTS public.users CASCADE")
-        logger.info("All tables dropped (users/tasks).")
+            logger.info("All tables dropped (users/tasks).")
+        finally:
+            await conn.close()
 
     @classmethod
     async def close(cls) -> None:
@@ -114,10 +136,19 @@ class Database:
         """
         Здесь — идемпотентные миграции. Добавляй новые ALTER’ы вниз.
         """
-        # 1) Добавить колонку training_program, если её ещё нет
+        # 1) training_program
         await conn.execute("""
             ALTER TABLE public.users
             ADD COLUMN IF NOT EXISTS training_program TEXT
+        """)
+        # 2) Анкета и напоминания
+        await conn.execute("""
+            ALTER TABLE public.users
+            ADD COLUMN IF NOT EXISTS training_form JSONB,
+            ADD COLUMN IF NOT EXISTS reminder_enabled BOOLEAN DEFAULT FALSE,
+            ADD COLUMN IF NOT EXISTS reminder_time TIME,
+            ADD COLUMN IF NOT EXISTS reminder_days TEXT[],
+            ADD COLUMN IF NOT EXISTS reminder_duration TEXT
         """)
 
     @classmethod
