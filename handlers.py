@@ -42,6 +42,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
 def registration_form_text() -> str:
     return (
         "✍️ Расскажите о своей программе тренировок и целях\n"
@@ -105,11 +106,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     async with Database.acquire() as conn:
         user_row = await conn.fetchrow(
-            "SELECT training_program, training_form FROM users WHERE user_id = $1",
+            "SELECT training_program, training_form, face_photo FROM users WHERE user_id = $1",
             user.id
         )
-    if not user_row:
-        await update.message.reply_text("👋 Добро пожаловать! Отправьте селфи 📸 для регистрации.")
+    if not user_row or not user_row.get("face_photo"):
+        await update.message.reply_text(
+            "👋 Добро пожаловать! Нажмите «📸 Сделать фото» ниже — камера откроется, и фото уйдёт через сайт.",
+            reply_markup=main_keyboard(),
+        )
         context.user_data["awaiting_face"] = True
         return
     elif not user_row["training_program"]:
@@ -127,63 +131,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("awaiting_face"):
-        return await handle_registration_photo(update, context)
-    if context.user_data.get("current_task"):
-        return await handle_task_photo(update, context)
-    await update.message.reply_text("⚠️ Неизвестный контекст. Используйте /start или /gym_task")
-
-async def handle_registration_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка фото при регистрации"""
-    user = update.effective_user
-    photo_file = await update.message.photo[-1].get_file()
-    path = settings.TEMP_DIR / f"face_{user.id}.jpg"
-    await photo_file.download_to_drive(path)
-
-    if path.stat().st_size > settings.MAX_PHOTO_SIZE:
-        await update.message.reply_text("⚠️ Фото слишком большое.")
-        path.unlink(missing_ok=True)
-        return
-
-    features = await extract_face_from_photo(path)
-    if features is None:
-        await update.message.reply_text("😕 Лицо не найдено. Попробуйте другое фото.")
-        path.unlink(missing_ok=True)
-        return
-
-    with open(path, 'rb') as f:
-        photo_bytes = f.read()
-
-    async with Database.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO users (user_id, username, first_name, last_name, face_features, face_photo)
-            VALUES ($1,$2,$3,$4,$5,$6)
-            ON CONFLICT (user_id) DO UPDATE
-            SET face_features = EXCLUDED.face_features,
-                face_photo = EXCLUDED.face_photo
-            """,
-            user.id, user.username, user.first_name, user.last_name,
-            pickle.dumps(features), photo_bytes
-        )
-
-    await update.message.reply_photo(photo=photo_bytes, caption="✅ Лицо сохранено для идентификации")
-
-    # --- ДОБАВЛЕНО: просим и программу, и анкету ---
-    context.user_data["awaiting_face"] = False
-    context.user_data["awaiting_program"] = True
+    # Полностью пересаживаем на веб-камеру
     await update.message.reply_text(
-        "📋 Опишите вашу программу тренировок или цели. Это поможет подбирать задания.",
+        "⚠️ Фото из чата не принимаю. Нажмите «📸 Сделать фото» — снимок пойдёт через сайт и будет проверен автоматически.",
         reply_markup=main_keyboard()
     )
-    context.user_data["awaiting_form"] = True
-    await update.message.reply_text(registration_form_text())
 
-    path.unlink(missing_ok=True)
+async def handle_registration_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Отказываемся от регистрации через чат-фото
+    await update.message.reply_text(
+        "📸 Для регистрации используйте кнопку «📸 Сделать фото» ниже — фото уйдёт через сайт.",
+        reply_markup=main_keyboard()
+    )
 
-
-async def _process_photo_bytes(user_id: int, photo_bytes: bytes, task_id: int | None, task_text: str | None, bot) -> bool:
-    """Возвращает True, если верификация прошла и задача закрыта."""
+async def _register_from_bytes(user, photo_bytes: bytes, bot, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Регистрация лица из байт фото (пришедших через веб)."""
     from tempfile import NamedTemporaryFile
     with NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp.write(photo_bytes)
@@ -192,7 +154,52 @@ async def _process_photo_bytes(user_id: int, photo_bytes: bytes, task_id: int | 
     try:
         features = await extract_face_from_photo(Path(tmp_path))
         if features is None:
-            await bot.send_message(chat_id=user_id, text="😕 Лицо не найдено. Попробуйте другое фото.")
+            await bot.send_message(chat_id=user.id, text="😕 Лицо не найдено. Попробуйте другое фото через кнопку ниже.")
+            await bot.send_message(chat_id=user.id, text="Нажмите «📸 Сделать фото».", reply_markup=main_keyboard())
+            return False
+
+        async with Database.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name, face_features, face_photo)
+                VALUES ($1,$2,$3,$4,$5,$6)
+                ON CONFLICT (user_id) DO UPDATE
+                SET face_features = EXCLUDED.face_features,
+                    face_photo = EXCLUDED.face_photo
+                """,
+                user.id, user.username, user.first_name, user.last_name,
+                pickle.dumps(features), photo_bytes
+            )
+
+        await bot.send_photo(chat_id=user.id, photo=photo_bytes, caption="✅ Лицо сохранено для идентификации")
+        # Просим программу и анкету
+        context.user_data["awaiting_face"] = False
+        context.user_data["awaiting_program"] = True
+        await bot.send_message(
+            chat_id=user.id,
+            text="📋 Опишите вашу программу тренировок или цели. Это поможет подбирать задания.",
+            reply_markup=main_keyboard()
+        )
+        context.user_data["awaiting_form"] = True
+        await bot.send_message(chat_id=user.id, text=registration_form_text())
+        return True
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+async def _process_photo_bytes(user_id: int, photo_bytes: bytes, task_id: int | None, task_text: str | None, bot) -> bool:
+    """Возвращает True, если верификация прошла и задача закрыта (для фото через веб)."""
+    from tempfile import NamedTemporaryFile
+    with NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp.write(photo_bytes)
+        tmp.flush()
+        tmp_path = tmp.name
+    try:
+        features = await extract_face_from_photo(Path(tmp_path))
+        if features is None:
+            await bot.send_message(chat_id=user_id, text="😕 Лицо не найдено. Попробуйте другое фото через кнопку.")
             return False
 
         # 2) сверка с эталоном
@@ -203,18 +210,26 @@ async def _process_photo_bytes(user_id: int, photo_bytes: bytes, task_id: int | 
                 stored_features = pickle.loads(ref_row["face_features"])
                 match, _ = compare_faces(stored_features, features)
                 if not match:
-                    await bot.send_message(chat_id=user_id, text="🚫 Лицо не совпало с профилем. Пришлите другое фото.")
+                    await bot.send_message(chat_id=user_id, text="🚫 Лицо не совпало с профилем. Сделайте другое фото через кнопку.")
                     return False
             except Exception as e:
                 logger.exception("Ошибка сравнения лиц: %s", e)
 
-        # 3) GPT‑проверка (если есть задание)
+        # 3) GPT-проверка (если есть задание)
         if task_text:
             gpt_result = await verify_task_with_gpt(task_text, tmp_path)
             if not gpt_result.get("success", False):
                 reason = gpt_result.get("reason", "Проверка не пройдена.")
                 await bot.send_message(chat_id=user_id, text=f"❌ GPT проверка не пройдена: {reason}")
                 return False
+        else:
+            # Нет активного задания — сообщаем явно
+            await bot.send_message(
+                chat_id=user_id,
+                text="ℹ️ Сейчас нет активного задания. Нажмите /gym_task, чтобы получить задание.",
+                reply_markup=main_keyboard()
+            )
+            return False
 
         # 4) апдейт задачи (если была)
         if task_id:
@@ -236,16 +251,11 @@ async def _process_photo_bytes(user_id: int, photo_bytes: bytes, task_id: int | 
             pass
 
 async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    task_id = context.user_data.get("current_task_id")
-    task_text = context.user_data.get("current_task")
-    if not task_id or not task_text:
-        await update.message.reply_text("⚠️ Нет активного задания.")
-        return
-    photo_file = await update.message.photo[-1].get_file()
-    photo_bytes = await photo_file.download_as_bytearray()
-    await _process_photo_bytes(user.id, bytes(photo_bytes), task_id, task_text, context.bot)
-
+    # Отказываемся от приёма фото заданий через чат
+    await update.message.reply_text(
+        "⚠️ Фото принимается только через кнопку «📸 Сделать фото» (веб). Нажмите её внизу.",
+        reply_markup=main_keyboard()
+    )
 
 async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.web_app_data:
@@ -260,7 +270,8 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not token:
         return
 
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
 
     # тянем файл с вашего сервера по токену
     pull_url = settings.make_pull_url(token)
@@ -271,7 +282,20 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return
             photo_bytes = await r.read()
 
-    # берём активное задание (если есть) из БД или из user_data
+    # Решаем: это регистрация или проверка задания
+    # Если ждём лицо — это регистрация
+    if context.user_data.get("awaiting_face"):
+        await _register_from_bytes(user, photo_bytes, context.bot, context)
+        return
+
+    # Если в БД нет лица — это тоже регистрация (первая загрузка)
+    async with Database.acquire() as conn:
+        urow = await conn.fetchrow("SELECT face_photo FROM users WHERE user_id=$1", user_id)
+    if not urow or not urow.get("face_photo"):
+        await _register_from_bytes(user, photo_bytes, context.bot, context)
+        return
+
+    # Иначе — пробуем закрыть активное задание
     async with Database.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -281,8 +305,17 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
             """,
             user_id
         )
+
     task_id = row["task_id"] if row else context.user_data.get("current_task_id")
     task_text = row["task_text"] if row else context.user_data.get("current_task")
+
+    if not task_id or not task_text:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="ℹ️ Сейчас нет активного задания. Нажмите /gym_task, чтобы получить задание.",
+            reply_markup=main_keyboard()
+        )
+        return
 
     await _process_photo_bytes(user_id, photo_bytes, task_id, task_text, context.bot)
 
@@ -323,7 +356,7 @@ async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["current_task_id"] = task_id
 
     await message.reply_text(
-        f"📋 Задание: {task}\n\nНажми ‘📸 Сделать фото’ внизу, я проверю автоматически.",
+        f"📋 Задание: {task}\n\nНажми ‘📸 Сделать фото’ внизу — снимок уйдёт через сайт, я проверю автоматически.",
         reply_markup=main_keyboard(),
     )
 
@@ -379,7 +412,6 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (
         f"📊 Выполнено: {comp}/{total} ({percent:.0f}%)\n"
         f"🗓️ Зарегистрирован: {urow['registration_date'].strftime('%d.%m.%Y') if urow.get('registration_date') else '—'}\n\n"
-        # f"🏋️ Задания:\n{urow['training_program'] or '—'}\n\n"
         f"📋 Анкета:\n{training_form_str or '—'}\n\n"
         f"⏰ Напоминания: {reminders_str}"
     )
@@ -512,8 +544,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_keyboard()
         )
         return
-
-
 
     # 6) Всё прочее
     await update.message.reply_text("⚠️ Неизвестный текст. Используйте меню или команды.")
