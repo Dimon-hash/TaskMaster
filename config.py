@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     TEMP_DIR: Path = Path("temp")
     MAX_PHOTO_SIZE: int = 5 * 1024 * 1024
     ADMIN_ID: int = 1670925755
+    WEBAPP_URL: AnyUrl = "https://breath-phantom-em-mercy.trycloudflare.com"
+    WEBAPP_API_PULL_URL: AnyUrl = "https://breath-phantom-em-mercy.trycloudflare.com"
 
     class Config:
         env_file = ".env.TaskMaster"

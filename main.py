@@ -56,6 +56,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📊 Профиль$"), handlers.profile))
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handlers.handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handlers.handle_webapp_data))
+
     # app.add_handler(CallbackQueryHandler(handlers.menu_callback))
 
     # (опционально) общий обработчик ошибок

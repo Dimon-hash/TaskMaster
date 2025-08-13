@@ -6,8 +6,9 @@ import re
 from datetime import datetime, timedelta, time
 from pathlib import Path
 import pytz
+import aiohttp
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 from telegram.ext import ContextTypes
 
 from database import Database
@@ -35,11 +36,12 @@ TZ = pytz.timezone(getattr(settings, "TIMEZONE", "Europe/Moscow"))
 # ---------------- Утилиты ----------------
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        # [[KeyboardButton("🏋️ Получить задание"), KeyboardButton("📊 Профиль")]],
-        [[KeyboardButton("📊 Профиль")]],
+        [
+            [KeyboardButton("📸 Сделать фото", web_app=WebAppInfo(url=str(settings.WEBAPP_URL)))],
+            [KeyboardButton("📊 Профиль")],
+        ],
         resize_keyboard=True,
     )
-
 def registration_form_text() -> str:
     return (
         "✍️ Расскажите о своей программе тренировок и целях\n"
@@ -179,76 +181,110 @@ async def handle_registration_photo(update: Update, context: ContextTypes.DEFAUL
 
     path.unlink(missing_ok=True)
 
-async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка фото для проверки выполнения задания"""
-    user = update.effective_user
-    task_id = context.user_data.get("current_task_id")
-    task_text = context.user_data.get("current_task")
 
-    if not task_id or not task_text:
-        await update.message.reply_text("⚠️ Нет активного задания.")
-        return
-
-    photo_file = await update.message.photo[-1].get_file()
-    path = settings.TEMP_DIR / f"task_{user.id}.jpg"
-    await photo_file.download_to_drive(path)
-
+async def _process_photo_bytes(user_id: int, photo_bytes: bytes, task_id: int | None, task_text: str | None, bot) -> bool:
+    """Возвращает True, если верификация прошла и задача закрыта."""
+    from tempfile import NamedTemporaryFile
+    with NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp.write(photo_bytes)
+        tmp.flush()
+        tmp_path = tmp.name
     try:
-        with open(path, 'rb') as f:
-            photo_bytes = f.read()
-
-        # 1) извлекаем фичи
-        features = await extract_face_from_photo(path)
+        features = await extract_face_from_photo(Path(tmp_path))
         if features is None:
-            await update.message.reply_text("😕 Лицо не найдено. Попробуйте другое фото.")
-            return
+            await bot.send_message(chat_id=user_id, text="😕 Лицо не найдено. Попробуйте другое фото.")
+            return False
 
-        # 2) сравниваем с эталоном из БД
+        # 2) сверка с эталоном
         async with Database.acquire() as conn:
-            ref_row = await conn.fetchrow(
-                "SELECT face_features FROM users WHERE user_id = $1",
-                user.id
-            )
-
+            ref_row = await conn.fetchrow("SELECT face_features FROM users WHERE user_id=$1", user_id)
         if ref_row and ref_row["face_features"]:
             try:
                 stored_features = pickle.loads(ref_row["face_features"])
-                match, score = compare_faces(stored_features, features)
+                match, _ = compare_faces(stored_features, features)
                 if not match:
-                    await update.message.reply_text("🚫 Лицо не совпало с профилем. Пришлите другое фото.")
-                    return
+                    await bot.send_message(chat_id=user_id, text="🚫 Лицо не совпало с профилем. Пришлите другое фото.")
+                    return False
             except Exception as e:
                 logger.exception("Ошибка сравнения лиц: %s", e)
 
-        # 3) GPT-проверка (путь должен существовать до вызова)
-        gpt_result = await verify_task_with_gpt(task_text, str(path))
-        if not gpt_result.get("success", False):
-            reason = gpt_result.get("reason", "Проверка не пройдена.")
-            await update.message.reply_text(f"❌ GPT проверка не пройдена: {reason}")
-            return
+        # 3) GPT‑проверка (если есть задание)
+        if task_text:
+            gpt_result = await verify_task_with_gpt(task_text, tmp_path)
+            if not gpt_result.get("success", False):
+                reason = gpt_result.get("reason", "Проверка не пройдена.")
+                await bot.send_message(chat_id=user_id, text=f"❌ GPT проверка не пройдена: {reason}")
+                return False
 
-        # 4) апдейт задачи
-        async with Database.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE tasks
-                SET status = 'completed',
-                    completion_date = CURRENT_TIMESTAMP,
-                    verification_photo = $1
-                WHERE task_id = $2
-                """,
-                photo_bytes, task_id
-            )
-
-        # 5) чистим состояние
-        context.user_data["current_task"] = None
-        context.user_data["current_task_id"] = None
-
-        await update.message.reply_text("✅ Задание выполнено и проверено! 🏆", reply_markup=main_keyboard())
-
+        # 4) апдейт задачи (если была)
+        if task_id:
+            async with Database.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status='completed', completion_date=CURRENT_TIMESTAMP, verification_photo=$1
+                    WHERE task_id=$2
+                    """,
+                    photo_bytes, task_id
+                )
+        await bot.send_message(chat_id=user_id, text="✅ Фото принято, проверка пройдена! 🏆", reply_markup=main_keyboard())
+        return True
     finally:
-        # удаляем временный файл в конце
-        Path(path).unlink(missing_ok=True)
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    task_id = context.user_data.get("current_task_id")
+    task_text = context.user_data.get("current_task")
+    if not task_id or not task_text:
+        await update.message.reply_text("⚠️ Нет активного задания.")
+        return
+    photo_file = await update.message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+    await _process_photo_bytes(user.id, bytes(photo_bytes), task_id, task_text, context.bot)
+
+
+async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.web_app_data:
+        return
+    try:
+        payload = json.loads(update.message.web_app_data.data)
+    except Exception:
+        return
+    if payload.get("type") != "photo_uploaded":
+        return
+    token = payload.get("token")
+    if not token:
+        return
+
+    user_id = update.effective_user.id
+
+    # тянем файл с вашего сервера по токену
+    pull_url = f"{settings.WEBAPP_API_PULL_URL}?token={token}"
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(pull_url, timeout=30) as r:
+            if r.status != 200:
+                await update.message.reply_text("⚠️ Не удалось получить фото с сервера.")
+                return
+            photo_bytes = await r.read()
+
+    # берём активное задание (если есть) из БД или из user_data
+    async with Database.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT task_id, task_text FROM tasks
+            WHERE user_id=$1 AND status='issued'
+            ORDER BY task_id DESC LIMIT 1
+            """,
+            user_id
+        )
+    task_id = row["task_id"] if row else context.user_data.get("current_task_id")
+    task_text = row["task_text"] if row else context.user_data.get("current_task")
+
+    await _process_photo_bytes(user_id, photo_bytes, task_id, task_text, context.bot)
 
 async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
@@ -287,7 +323,7 @@ async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["current_task_id"] = task_id
 
     await message.reply_text(
-        f"📋 Задание: {task}\n📸 Отправьте фото для проверки.",
+        f"📋 Задание: {task}\n\nНажми ‘📸 Сделать фото’ внизу, я проверю автоматически.",
         reply_markup=main_keyboard(),
     )
 
@@ -547,8 +583,8 @@ def _schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: 
             await ctx.bot.send_message(
                 chat_id=user_id,
                 text=(f"{phase_text}\n\n"
-                      f"📋 Новое задание: {task_text}\n"
-                      f"📸 Пришли одно фото — я проверю.")
+                      f"📋 Новое задание: {task_text}\n\n"
+                      "Нажми ‘📸 Сделать фото’ — камера откроется и через 3 сек. я сделаю кадр автоматически.")
             )
         except Exception as e:
             logger.exception("_create_new_task_and_prompt failed for user %s: %s", user_id, e)
