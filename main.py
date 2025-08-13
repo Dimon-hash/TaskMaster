@@ -49,10 +49,10 @@ def main():
     app.add_handler(CommandHandler('gym_task', handlers.gym_task))
     app.add_handler(CommandHandler('profile', handlers.profile))
     app.add_handler(CommandHandler('sendphoto', handlers.send_photo))
-    app.add_handler(CommandHandler('setup_reminders', handlers.setup_reminders))
+    # app.add_handler(CommandHandler('setup_reminders', handlers.setup_reminders)) обновить время тренировок
     app.add_handler(CommandHandler('delete_db', handlers.delete_db))
 
-    app.add_handler(MessageHandler(filters.Regex("^🏋️ Получить задание$"), handlers.gym_task))
+    # app.add_handler(MessageHandler(filters.Regex("^🏋️ Получить задание$"), handlers.gym_task))
     app.add_handler(MessageHandler(filters.Regex("^📊 Профиль$"), handlers.profile))
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handlers.handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
