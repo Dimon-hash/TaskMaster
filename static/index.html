@@ -9,64 +9,127 @@
     .wrap{padding:16px;display:flex;flex-direction:column;gap:12px;align-items:center}
     video,canvas{width:100%;max-width:480px;border-radius:16px}
     .count{font-size:28px;font-weight:700;margin:8px}
-    .btn{padding:12px 16px;border:0;border-radius:12px;font-size:16px;background:#1f6feb;color:#fff}
     .muted{opacity:.8;font-size:14px}
     .err{color:#ff6b6b}
+    .hidden{display:none}
   </style>
 </head>
 <body>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
 <div class="wrap">
   <div class="muted">Камера запустится автоматически. Первый раз ОС спросит разрешение.</div>
   <video id="v" playsinline autoplay muted></video>
+  <canvas id="c" class="hidden"></canvas>
   <div id="count" class="count"></div>
-  <button id="cancel" class="btn">Отмена</button>
   <div id="msg" class="muted"></div>
-  <canvas id="c" style="display:none"></canvas>
 </div>
+
 <script>
-const tg = window.Telegram.WebApp; tg.expand();
-let canceled = false;
-const v = document.getElementById('v');
-const c = document.getElementById('c');
-const count = document.getElementById('count');
-const msg = document.getElementById('msg');
+(() => {
+  const tg = window.Telegram?.WebApp;
+  tg?.expand?.();
+  tg?.ready?.();
 
-document.getElementById('cancel').onclick = () => { canceled = true; tg.close(); };
+  let sent = false, stream = null;
+  const v = document.getElementById('v');
+  const c = document.getElementById('c');
+  const count = document.getElementById('count');
+  const msg = document.getElementById('msg');
 
-(async () => {
-  try{
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-    v.srcObject = stream;
+  const inTelegram = !!(tg && (tg.platform || tg.initDataUnsafe?.user || (tg.initData && tg.initData.length)));
+  const qs = new URLSearchParams(location.search);
+  const dev = qs.get('dev') === '1' || !inTelegram;
 
-    // ждём метаданные видеопотока
-    await new Promise(res => v.onloadedmetadata ? res() : v.addEventListener('loadedmetadata', res, {once:true}));
+  function stopStream(){ try{ stream?.getTracks?.().forEach(t=>t.stop()); }catch(_){} stream=null; }
+  function setMsg(text, isErr=false){ msg.textContent=text; msg.className=isErr ? 'err' : 'muted'; }
 
-    // обратный отсчёт 3..2..1
-    for(let n=3;n>0;n--){ if(canceled) return; count.textContent = n; await new Promise(r=>setTimeout(r,1000)); }
-    count.textContent = '';
-    if(canceled) return;
-
-    // снимок
-    const w = Math.min(1280, v.videoWidth || 720);
-    const h = Math.round(w * (v.videoHeight/(v.videoWidth||1)));
-    c.width = w; c.height = h; c.getContext('2d').drawImage(v,0,0,w,h);
-    const blob = await new Promise(res => c.toBlob(res, 'image/jpeg', 0.85));
-
-    // загрузка на сервер -> получаем token
-    const form = new FormData();
-    form.append('photo', blob, 'auto.jpg');
-    form.append('initData', tg.initData);
-    const r = await fetch('/upload', { method:'POST', body:form, credentials:'include' });
-    if(!r.ok) throw new Error(await r.text());
-    const data = await r.json();
-
-    // отправляем токен в бота
-    tg.sendData(JSON.stringify({ type:'photo_uploaded', token:data.token, auto:true }));
-    tg.close();
-  }catch(e){
-    msg.className='err'; msg.textContent='Ошибка камеры: '+e.message;
+  function canvasToBlob(canvas, type='image/jpeg', quality=0.85){
+    return new Promise(res=>{
+      if (canvas.toBlob) return canvas.toBlob(b=>res(b), type, quality);
+      // фолбэк для старых Safari
+      const dataURL = canvas.toDataURL(type, quality);
+      const bin = atob(dataURL.split(',')[1]);
+      const bytes = new Uint8Array(bin.length);
+      for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+      res(new Blob([bytes], {type}));
+    });
   }
+
+  async function run(){
+    try{
+      // 1) камера
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:'user' } }, audio:false });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+      }
+      v.srcObject = stream;
+
+      await new Promise(res=>{
+        if (v.readyState >= 1) return res();
+        v.addEventListener('loadedmetadata', res, {once:true});
+      });
+      try { await v.play(); } catch {}
+
+      // 2) отсчёт
+      for (let n=3;n>0;n--){
+        count.textContent = n;
+        await new Promise(r=>setTimeout(r,1000));
+      }
+      count.textContent = '';
+
+      // 3) снимок + короткое превью
+      const vw=v.videoWidth||720, vh=v.videoHeight||1280;
+      const w=Math.min(1280,vw), h=Math.round(w*(vh/vw));
+      c.width=w; c.height=h;
+      c.getContext('2d').drawImage(v,0,0,w,h);
+      v.classList.add('hidden');
+      c.classList.remove('hidden');
+      stopStream();
+
+      // 4) JPEG
+      const blob = await canvasToBlob(c,'image/jpeg',0.85);
+
+      // 5) загрузка
+      setMsg('Загружаю фото…');
+      const form = new FormData();
+      form.append('photo', blob, 'auto.jpg');
+      form.append('initData', inTelegram ? (tg.initData || '') : '');
+      const uploadUrl = new URL('/upload' + (dev ? '?dev=1' : ''), location.origin).toString();
+      const r = await fetch(uploadUrl, { method:'POST', body:form });
+      if (!r.ok){
+        const t = await r.text().catch(()=>String(r.status));
+        throw new Error(`Upload failed: ${r.status} ${t}`);
+      }
+      const data = await r.json();
+      if (!data?.token) throw new Error('No token from server');
+
+      // 6) автоотправка в бота
+      if (inTelegram){
+        if (sent) return; sent = true;
+        setMsg('Отправляю…');
+        try {
+          tg.sendData(JSON.stringify({ type:'photo_uploaded', token:data.token, auto:true }));
+        } finally {
+          setTimeout(()=>tg.close(), 150);
+        }
+      } else {
+        // dev/браузер
+        setMsg('Готово (dev). Токен для /pull: ' + data.token);
+      }
+
+    } catch(e){
+      console.error(e);
+      setMsg('Ошибка камеры/загрузки: ' + (e?.message || e), true);
+      stopStream();
+      // В Телеграме просто оставим экран с ошибкой (без кнопок)
+    }
+  }
+
+  window.addEventListener('beforeunload', () => { stopStream(); });
+
+  run();
 })();
 </script>
 </body>

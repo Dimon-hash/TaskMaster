@@ -263,7 +263,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
 
     # тянем файл с вашего сервера по токену
-    pull_url = f"{settings.WEBAPP_API_PULL_URL}?token={token}"
+    pull_url = settings.make_pull_url(token)
     async with aiohttp.ClientSession() as sess:
         async with sess.get(pull_url, timeout=30) as r:
             if r.status != 200:
