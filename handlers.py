@@ -35,7 +35,8 @@ TZ = pytz.timezone(getattr(settings, "TIMEZONE", "Europe/Moscow"))
 # ---------------- Утилиты ----------------
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("🏋️ Получить задание"), KeyboardButton("📊 Профиль")]],
+        # [[KeyboardButton("🏋️ Получить задание"), KeyboardButton("📊 Профиль")]],
+        [[KeyboardButton("📊 Профиль")]],
         resize_keyboard=True,
     )
 
