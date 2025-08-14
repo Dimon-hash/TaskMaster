@@ -1,24 +1,101 @@
 # handlers.py
 import logging
-import pickle
-import json
 import re
+import json
 from datetime import datetime, timedelta, time
-from pathlib import Path
-import pytz
-import aiohttp
+from typing import List, Optional
 
+import aiohttp
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 from telegram.ext import ContextTypes
 
 from database import Database
-from image_processor import extract_face_from_photo, compare_faces
-from gpt_tasks import generate_gpt_task, verify_task_with_gpt
+from gpt_tasks import verify_task_with_gpt  # опционально, используем для фото-проверки сетов
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-# ---------------- Константы/настройки ----------------
+# ---------------- Утилиты ----------------
+def _is_admin(user_id: int) -> bool:
+    """Проверка прав админа."""
+    try:
+        if user_id == getattr(settings, "ADMIN_ID", 0):
+            return True
+        admin_ids = set(getattr(settings, "ADMIN_IDS", []) or [])
+        return user_id in admin_ids
+    except Exception:
+        return False
+
+def _mask_token(s: Optional[str], keep: int = 6) -> str:
+    """Маскируем токен в логах."""
+    if not isinstance(s, str):
+        return str(s)
+    return (s[:keep] + "…") if len(s) > keep else s
+
+# ---------------- Клавиатуры ----------------
+def _make_keyboard(is_workout: bool, user_id: int) -> ReplyKeyboardMarkup:
+    rows = []
+    if is_workout:
+        # НОВОЕ: один снимок через 10–30 сек после нажатия
+        rows.append([
+            KeyboardButton(
+                "▶️ Начать подход",
+                web_app=WebAppInfo(
+                    url=str(settings.WEBAPP_URL)
+                    + "?mode=workout"
+                    + "&shots=1"
+                    + "&delay_min=10"
+                    + "&delay_max=30"
+                    + "&verify=home"
+                )
+            )
+        ])
+    rows.append([KeyboardButton("📊 Профиль")])
+
+    # Админские кнопки
+    if _is_admin(user_id):
+        rows.append([KeyboardButton("🟢 Старт тренировки (админ)"),
+                     KeyboardButton("🔴 Стоп тренировки (админ)")])
+        rows.append([KeyboardButton("/delete_db"), KeyboardButton("/clear_db")])
+
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def days_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["пн ср пт", "вт чт сб", "пн-пт"],
+            ["каждый день", "сб вс", "без расписания"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+def time_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["07:00", "08:00", "18:00"],
+            ["19:00", "19:30", "20:00"],
+            ["Другое время"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+def duration_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["30", "45", "60"],
+            ["75", "90"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+def _current_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> ReplyKeyboardMarkup:
+    active = bool(context.application.bot_data.get("session_active", {}).get(user_id))
+    return _make_keyboard(active, user_id)
+
+# ---------------- Парсеры ----------------
 WEEKDAYS_MAP = {
     'пн': 'mon', 'пон': 'mon', 'понедельник': 'mon',
     'вт': 'tue', 'вторник': 'tue',
@@ -29,46 +106,11 @@ WEEKDAYS_MAP = {
     'вс': 'sun', 'воскресенье': 'sun'
 }
 
-# Можно переопределить таймзону в config.settings.TIMEZONE
-TZ = pytz.timezone(getattr(settings, "TIMEZONE", "Europe/Moscow"))
+ORDERED_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+RU_BY_EN = {'mon': 'пн', 'tue': 'вт', 'wed': 'ср', 'thu': 'чт', 'fri': 'пт', 'sat': 'сб', 'sun': 'вс'}
 
-
-# ---------------- Утилиты ----------------
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📸 Сделать фото", web_app=WebAppInfo(url=str(settings.WEBAPP_URL)))],
-            [KeyboardButton("📊 Профиль")],
-        ],
-        resize_keyboard=True,
-    )
-
-def registration_form_text() -> str:
-    return (
-        "✍️ Расскажите о своей программе тренировок и целях\n"
-        "Чтобы я выдавал задания ровно под вас (и чтобы их можно было подтвердить одним фото), "
-        "ответьте коротко по пунктам. Можно списком, без романов.\n\n"
-        "1) Цели на 1–2 месяца (несколько можно)\n"
-        "Похудение / Набор мышц / Сила / Выносливость / Бокс / Осанка/спина/шея / Другое: ___\n\n"
-        "2) Опыт и ограничения\n"
-        "Уровень: новичок / средний / продвинутый\n"
-        "Травмы/боль: ___\n"
-        "Что нельзя/не хочу: ___\n\n"
-        "3) Доступный инвентарь (зал/дом, что есть?)\n\n"
-        "4) Режим: сколько раз в неделю; длительность: 20–30 / 40–60 / >60; "
-        "плавный режим без жёсткого расписания: да/нет\n\n"
-        "5) Предпочтения по упражнениям (штанга/тренажёры/турник/кардио/бокс/шея/кор/другое)\n\n"
-        "6) Чего НЕ надо предлагать: ___\n\n"
-        "7) Фото-подтверждение: лицо ок? да/нет; удобнее: селфи у снаряда / фото снаряда; "
-        "можно фото блинов/гири с весом? да/нет\n\n"
-        "8) Метрики прогресса: вес/повторы/время/дистанция/пульс/RPE? Что важнее лично вам?\n\n"
-        "9) Мини-челленджи иногда нужны? да/нет\n\n"
-        "10) Комментарии: ___\n\n"
-        "После анкеты спрошу дни/время для напоминаний 💡"
-    )
-
-def _parse_time_hhmm(s: str) -> time | None:
-    m = re.search(r'(\d{1,2})[:.](\d{2})', s)
+def _parse_time_hhmm(s: str) -> Optional[time]:
+    m = re.search(r'(\d{1,2})[:.](\d{2})', s or "")
     if not m:
         return None
     hh, mm = int(m.group(1)), int(m.group(2))
@@ -76,480 +118,126 @@ def _parse_time_hhmm(s: str) -> time | None:
         return time(hour=hh, minute=mm)
     return None
 
-def _parse_days(s: str) -> list[str]:
-    s = s.strip().lower()
+def _parse_days(s: str) -> List[str]:
+    s = (s or "").strip().lower()
+    if not s or s == "без расписания":
+        return []
     if 'каждый день' in s or 'ежеднев' in s or 'все дни' in s or 'пн-вс' in s:
-        return ['mon','tue','wed','thu','fri','sat','sun']
+        return ORDERED_DAYS.copy()
+
     rng = re.search(r'(пн|пон|вт|ср|чт|пт|сб|вс)\s*-\s*(пн|пон|вт|ср|чт|пт|сб|вс)', s)
     if rng:
         a, b = WEEKDAYS_MAP[rng.group(1)], WEEKDAYS_MAP[rng.group(2)]
-        order = ['mon','tue','wed','thu','fri','sat','sun']
-        ia, ib = order.index(a), order.index(b)
-        return order[ia:ib+1] if ia <= ib else order[ia:]+order[:ib+1]
+        ia, ib = ORDERED_DAYS.index(a), ORDERED_DAYS.index(b)
+        return ORDERED_DAYS[ia:ib+1] if ia <= ib else ORDERED_DAYS[ia:]+ORDERED_DAYS[:ib+1]
+
     days = []
     for token in re.split(r'[,\s]+', s):
+        token = token.strip()
         if token in WEEKDAYS_MAP:
             days.append(WEEKDAYS_MAP[token])
-    return list(dict.fromkeys(days))
+    seen = set()
+    uniq = []
+    for d in days:
+        if d not in seen:
+            uniq.append(d)
+            seen.add(d)
+    return uniq
 
-def _dur_to_minutes(d: str) -> int:
-    d = d.strip().replace('мин', '').replace(' ', '').replace('—', '-')
-    if '20-30' in d:
-        return 30
-    if '40-60' in d:
-        return 60
-    return 75  # >60
+def _human_days(days: List[str]) -> str:
+    if not days:
+        return "без расписания"
+    return " ".join(RU_BY_EN[d] for d in days if d in RU_BY_EN)
 
-
-# ---------------- Твои хендлеры (с расширениями) ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    async with Database.acquire() as conn:
-        user_row = await conn.fetchrow(
-            "SELECT training_program, training_form, face_photo FROM users WHERE user_id = $1",
-            user.id
-        )
-    if not user_row or not user_row.get("face_photo"):
-        await update.message.reply_text(
-            "👋 Добро пожаловать! Нажмите «📸 Сделать фото» ниже — камера откроется, и фото уйдёт через сайт.",
-            reply_markup=main_keyboard(),
-        )
-        context.user_data["awaiting_face"] = True
-        return
-    elif not user_row["training_program"]:
-        await update.message.reply_text("✍️ Расскажите о своей программе тренировок или целях.")
-        context.user_data["awaiting_program"] = True
-        return
-    elif not user_row["training_form"]:
-        context.user_data["awaiting_form"] = True
-        await update.message.reply_text(registration_form_text())
-        return
-    else:
-        await update.message.reply_text(
-            "ℹ️ Вы уже зарегистрированы. Используйте меню ниже 💪",
-            reply_markup=main_keyboard(),
-        )
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Полностью пересаживаем на веб-камеру
-    await update.message.reply_text(
-        "⚠️ Фото из чата не принимаю. Нажмите «📸 Сделать фото» — снимок пойдёт через сайт и будет проверен автоматически.",
-        reply_markup=main_keyboard()
-    )
-
-async def handle_registration_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Отказываемся от регистрации через чат-фото
-    await update.message.reply_text(
-        "📸 Для регистрации используйте кнопку «📸 Сделать фото» ниже — фото уйдёт через сайт.",
-        reply_markup=main_keyboard()
-    )
-
-async def _register_from_bytes(user, photo_bytes: bytes, bot, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Регистрация лица из байт фото (пришедших через веб)."""
+# ---------------- Фото-проверка тренировки (опционально) ----------------
+async def _save_training_photo(user_id: int, photo_bytes: bytes, bot) -> bool:
+    """
+    Сохраняет фото тренировки в sets и прогоняет GPT-проверку.
+    Требования:
+      — человек выполняет упражнение (не поза/селфи),
+      — отсутствие признаков монтажа/скриншотов/старых фото,
+      — ДОМ (квартира/комната/дом/домашний инвентарь), а не коммерческий зал.
+    GPT должен вернуть JSON: {"success": bool, "is_home": bool, "reason": string}
+    """
     from tempfile import NamedTemporaryFile
+    from pathlib import Path
+
+    logger.info("[sets] user=%s: received photo bytes=%d", user_id, len(photo_bytes))
+
     with NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp.write(photo_bytes)
         tmp.flush()
         tmp_path = tmp.name
+
     try:
-        features = await extract_face_from_photo(Path(tmp_path))
-        if features is None:
-            await bot.send_message(chat_id=user.id, text="😕 Лицо не найдено. Попробуйте другое фото через кнопку ниже.")
-            await bot.send_message(chat_id=user.id, text="Нажмите «📸 Сделать фото».", reply_markup=main_keyboard())
-            return False
+        check_text = (
+            "Оцени фото как доказательство тренировки ДОМА.\n"
+            "Критерии:\n"
+            "1) На фото человек ВЫПОЛНЯЕТ упражнение (а не позирует/селфи/показывает инвентарь).\n"
+            "2) Фото актуально, не скриншот, без монтажей.\n"
+            "3) ЛОКАЦИЯ: жилое помещение (квартира/комната/дом) или домашний инвентарь; "
+            "НЕ допускается коммерческий зал/публичный фитнес-центр.\n"
+            "Верни строго JSON: {\"success\": bool, \"is_home\": bool, \"reason\": string}."
+        )
+
+        logger.info("[sets] user=%s: sending to GPT verify…", user_id)
+        gpt = await verify_task_with_gpt(check_text, tmp_path)
+        verified = bool(gpt.get("success"))
+        is_home = bool(gpt.get("is_home"))
+        reason = gpt.get("reason", "")
+
+        if verified and not is_home:
+            verified = False
+            reason = reason or "Обстановка не похожа на домашнюю"
+
+        logger.info("[sets] user=%s: GPT result verified=%s is_home=%s reason=%r",
+                    user_id, verified, is_home, reason)
 
         async with Database.acquire() as conn:
             await conn.execute(
-                """
-                INSERT INTO users (user_id, username, first_name, last_name, face_features, face_photo)
-                VALUES ($1,$2,$3,$4,$5,$6)
-                ON CONFLICT (user_id) DO UPDATE
-                SET face_features = EXCLUDED.face_features,
-                    face_photo = EXCLUDED.face_photo
-                """,
-                user.id, user.username, user.first_name, user.last_name,
-                pickle.dumps(features), photo_bytes
+                "INSERT INTO sets (user_id, photo, verified, gpt_reason) VALUES ($1, $2, $3, $4)",
+                user_id, photo_bytes, verified, reason
             )
 
-        await bot.send_photo(chat_id=user.id, photo=photo_bytes, caption="✅ Лицо сохранено для идентификации")
-        # Просим программу и анкету
-        context.user_data["awaiting_face"] = False
-        context.user_data["awaiting_program"] = True
-        await bot.send_message(
-            chat_id=user.id,
-            text="📋 Опишите вашу программу тренировок или цели. Это поможет подбирать задания.",
-            reply_markup=main_keyboard()
-        )
-        context.user_data["awaiting_form"] = True
-        await bot.send_message(chat_id=user.id, text=registration_form_text())
-        return True
-    finally:
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-async def _process_photo_bytes(user_id: int, photo_bytes: bytes, task_id: int | None, task_text: str | None, bot) -> bool:
-    """Возвращает True, если верификация прошла и задача закрыта (для фото через веб)."""
-    from tempfile import NamedTemporaryFile
-    with NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp.write(photo_bytes)
-        tmp.flush()
-        tmp_path = tmp.name
-    try:
-        features = await extract_face_from_photo(Path(tmp_path))
-        if features is None:
-            await bot.send_message(chat_id=user_id, text="😕 Лицо не найдено. Попробуйте другое фото через кнопку.")
-            return False
-
-        # 2) сверка с эталоном
-        async with Database.acquire() as conn:
-            ref_row = await conn.fetchrow("SELECT face_features FROM users WHERE user_id=$1", user_id)
-        if ref_row and ref_row["face_features"]:
-            try:
-                stored_features = pickle.loads(ref_row["face_features"])
-                match, _ = compare_faces(stored_features, features)
-                if not match:
-                    await bot.send_message(chat_id=user_id, text="🚫 Лицо не совпало с профилем. Сделайте другое фото через кнопку.")
-                    return False
-            except Exception as e:
-                logger.exception("Ошибка сравнения лиц: %s", e)
-
-        # 3) GPT-проверка (если есть задание)
-        if task_text:
-            gpt_result = await verify_task_with_gpt(task_text, tmp_path)
-            if not gpt_result.get("success", False):
-                reason = gpt_result.get("reason", "Проверка не пройдена.")
-                await bot.send_message(chat_id=user_id, text=f"❌ GPT проверка не пройдена: {reason}")
-                return False
+        if verified:
+            await bot.send_message(chat_id=user_id, text="✅ Фото засчитано (дом).")
         else:
-            # Нет активного задания — сообщаем явно
-            await bot.send_message(
-                chat_id=user_id,
-                text="ℹ️ Сейчас нет активного задания. Нажмите /gym_task, чтобы получить задание.",
-                reply_markup=main_keyboard()
-            )
-            return False
-
-        # 4) апдейт задачи (если была)
-        if task_id:
-            async with Database.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE tasks
-                    SET status='completed', completion_date=CURRENT_TIMESTAMP, verification_photo=$1
-                    WHERE task_id=$2
-                    """,
-                    photo_bytes, task_id
-                )
-        await bot.send_message(chat_id=user_id, text="✅ Фото принято, проверка пройдена! 🏆", reply_markup=main_keyboard())
-        return True
+            await bot.send_message(chat_id=user_id, text="❌ Не засчитано: " + (reason or "не прошла проверка"))
+        return verified
+    except Exception as e:
+        logger.exception("Photo verify/save failed: %s", e)
+        try:
+            await bot.send_message(chat_id=user_id, text="⚠️ Не удалось проверить фото. Попробуй ещё раз.")
+        except Exception:
+            pass
+        return False
     finally:
         try:
             Path(tmp_path).unlink(missing_ok=True)
         except Exception:
             pass
 
-async def handle_task_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Отказываемся от приёма фото заданий через чат
-    await update.message.reply_text(
-        "⚠️ Фото принимается только через кнопку «📸 Сделать фото» (веб). Нажмите её внизу.",
-        reply_markup=main_keyboard()
-    )
-
-async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.web_app_data:
-        return
-    try:
-        payload = json.loads(update.message.web_app_data.data)
-    except Exception:
-        return
-    if payload.get("type") != "photo_uploaded":
-        return
-    token = payload.get("token")
-    if not token:
-        return
-
-    user = update.effective_user
-    user_id = user.id
-
-    # тянем файл с вашего сервера по токену
-    pull_url = settings.make_pull_url(token)
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(pull_url, timeout=30) as r:
-            if r.status != 200:
-                await update.message.reply_text("⚠️ Не удалось получить фото с сервера.")
-                return
-            photo_bytes = await r.read()
-
-    # Решаем: это регистрация или проверка задания
-    # Если ждём лицо — это регистрация
-    if context.user_data.get("awaiting_face"):
-        await _register_from_bytes(user, photo_bytes, context.bot, context)
-        return
-
-    # Если в БД нет лица — это тоже регистрация (первая загрузка)
-    async with Database.acquire() as conn:
-        urow = await conn.fetchrow("SELECT face_photo FROM users WHERE user_id=$1", user_id)
-    if not urow or not urow.get("face_photo"):
-        await _register_from_bytes(user, photo_bytes, context.bot, context)
-        return
-
-    # Иначе — пробуем закрыть активное задание
-    async with Database.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT task_id, task_text FROM tasks
-            WHERE user_id=$1 AND status='issued'
-            ORDER BY task_id DESC LIMIT 1
-            """,
-            user_id
-        )
-
-    task_id = row["task_id"] if row else context.user_data.get("current_task_id")
-    task_text = row["task_text"] if row else context.user_data.get("current_task")
-
-    if not task_id or not task_text:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="ℹ️ Сейчас нет активного задания. Нажмите /gym_task, чтобы получить задание.",
-            reply_markup=main_keyboard()
-        )
-        return
-
-    await _process_photo_bytes(user_id, photo_bytes, task_id, task_text, context.bot)
-
-async def gym_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message or update.callback_query.message
-    user = update.effective_user
-
-    async with Database.acquire() as conn:
-        user_row = await conn.fetchrow(
-            "SELECT training_program FROM users WHERE user_id = $1",
-            user.id
-        )
-
-    if not user_row:
-        await message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
-        return
-
-    training_program = user_row["training_program"]
-    if not training_program:
-        await message.reply_text("✍️ Сначала расскажите о своей программе тренировок. Отправьте текст.")
-        context.user_data["awaiting_program"] = True
-        return
-
-    # фикс: передаём программу в функцию
-    task = await generate_gpt_task(training_program)
-
-    async with Database.acquire() as conn:
-        task_id = await conn.fetchval(
-            """
-            INSERT INTO tasks (user_id, task_text, status)
-            VALUES ($1,$2,'issued')
-            RETURNING task_id
-            """,
-            user.id, task
-        )
-
-    context.user_data["current_task"] = task
-    context.user_data["current_task_id"] = task_id
-
-    await message.reply_text(
-        f"📋 Задание: {task}\n\nНажми ‘📸 Сделать фото’ внизу — снимок уйдёт через сайт, я проверю автоматически.",
-        reply_markup=main_keyboard(),
-    )
-
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message or update.callback_query.message
-    user = update.effective_user
-
-    async with Database.acquire() as conn:
-        urow = await conn.fetchrow(
-            """
-            SELECT face_photo, registration_date, training_program, training_form,
-                   reminder_enabled, reminder_days, reminder_time, reminder_duration
-            FROM users WHERE user_id = $1
-            """,
-            user.id
-        )
-
-        if not urow:
-            await message.reply_text("🚫 Вы не зарегистрированы. Используйте /start")
-            return
-
-        trow = await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*) AS total_tasks,
-                COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_tasks
-            FROM tasks
-            WHERE user_id = $1
-            """,
-            user.id
-        )
-
-    total = int(trow["total_tasks"] or 0)
-    comp = int(trow["completed_tasks"] or 0)
-    percent = (comp / total * 100) if total else 0
-
-    # Формируем блок анкеты
-    training_form_str = ""
-    if urow["training_form"]:
-        try:
-            form_data = json.loads(urow["training_form"])
-            training_form_str = form_data.get("raw", "")
-        except Exception:
-            training_form_str = str(urow["training_form"])
-
-    reminders_str = "❌ Выключены"
-    if urow["reminder_enabled"]:
-        days_str = " ".join(urow["reminder_days"] or [])
-        time_str = urow["reminder_time"].strftime("%H:%M") if urow["reminder_time"] else "—"
-        dur_str = f"{urow['reminder_duration']} мин"
-        reminders_str = f"✅ {days_str} в {time_str}, длительность {dur_str}"
-
-    caption = (
-        f"📊 Выполнено: {comp}/{total} ({percent:.0f}%)\n"
-        f"🗓️ Зарегистрирован: {urow['registration_date'].strftime('%d.%m.%Y') if urow.get('registration_date') else '—'}\n\n"
-        f"📋 Анкета:\n{training_form_str or '—'}\n\n"
-        f"⏰ Напоминания: {reminders_str}"
-    )
-
-    photo_bytes = urow.get("face_photo")
-    if photo_bytes:
-        await message.reply_photo(
-            photo=photo_bytes,
-            caption=caption,
-            reply_markup=main_keyboard(),
-        )
+# ---------------- Помощники сессии ----------------
+def _set_session_active(context: ContextTypes.DEFAULT_TYPE, user_id: int, active: bool) -> None:
+    sa = context.application.bot_data.setdefault("session_active", {})
+    if active:
+        sa[user_id] = True
     else:
-        await message.reply_text(
-            caption,
-            reply_markup=main_keyboard(),
-        )
+        sa.pop(user_id, None)
 
+def _is_session_active(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    return bool(context.application.bot_data.get("session_active", {}).get(user_id))
 
-async def delete_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != settings.ADMIN_ID:
-        await update.message.reply_text("🚫 Доступ запрещён.")
-        return
-    await Database.drop()
-    await Database.init()
-    await update.message.reply_text("🗑️ База данных удалена.")
+# ---------------- Планировщик напоминаний ----------------
+def _shift_days(days_tuple: tuple[int, ...], offset: int) -> tuple[int, ...]:
+    """Сдвиг дней недели (0..6) на offset вперёд, с модулем 7."""
+    return tuple(((d + offset) % 7) for d in days_tuple)
 
-async def send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    async with Database.acquire() as conn:
-        photo_bytes = await conn.fetchval(
-            "SELECT face_photo FROM users WHERE user_id = $1", user.id
-        )
-
-    if not photo_bytes:
-        await update.message.reply_text("⚠️ Фото не найдено. Вы ещё не регистрировались.")
-        return
-
-    await update.message.reply_photo(
-        photo=photo_bytes,
-        caption="Ваше сохранённое фото для идентификации"
-    )
-
-# --------- НОВОЕ: обработка анкеты и напоминаний ---------
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) Сохранение твоей программы (оставлено как было)
-    if context.user_data.get("awaiting_program"):
-        program = update.message.text.strip()
-        async with Database.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET training_program=$1 WHERE user_id=$2",
-                program, update.effective_user.id,
-            )
-        context.user_data["awaiting_program"] = False
-        await update.message.reply_text("✅ Программа сохранена!", reply_markup=main_keyboard())
-        # не выходим — пользователь может сразу прислать и анкету
-
-    text = (update.message.text or "").strip()
-
-    # 2) Анкета (новое)
-    if context.user_data.get("awaiting_form"):
-        async with Database.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET training_form=$1 WHERE user_id=$2",
-                json.dumps({"raw": text}, ensure_ascii=False),
-                update.effective_user.id
-            )
-        context.user_data["awaiting_form"] = False
-        context.user_data["awaiting_reminder_days"] = True
-        await update.message.reply_text(
-            "🗓️ В какие дни обычно тренируешься? Примеры: «пн ср пт», «пн-пт», «каждый день»."
-        )
-        return
-
-    # 3) Дни для напоминаний
-    if context.user_data.get("awaiting_reminder_days"):
-        days = _parse_days(text)
-        if not days:
-            await update.message.reply_text("Не распознал дни. Пример: «пн ср пт», «пн-пт», «каждый день».")
-            return
-        context.user_data["reminder_days"] = days
-        context.user_data["awaiting_reminder_days"] = False
-        context.user_data["awaiting_reminder_time"] = True
-        await update.message.reply_text("⏰ Во сколько обычно начинаешь тренировку? (например, 19:30)")
-        return
-
-    # 4) Время
-    if context.user_data.get("awaiting_reminder_time"):
-        t = _parse_time_hhmm(text)
-        if not t:
-            await update.message.reply_text("Не понял время. Пример: 19:30")
-            return
-        context.user_data["reminder_time"] = t
-        context.user_data["awaiting_reminder_time"] = False
-        context.user_data["awaiting_reminder_duration"] = True
-        await update.message.reply_text("⏱️ Введите длительность тренировки в минутах, например: 45")
-        return
-
-    # 5) Длительность + включаем напоминания
-    if context.user_data.get("awaiting_reminder_duration"):
-        try:
-            dur_min = int(re.sub(r'\D', '', text))  # вытащим только числа
-            if dur_min <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Введите длительность тренировки в минутах, например: 45")
-            return
-
-        user_id = update.effective_user.id
-        days = context.user_data["reminder_days"]
-        t: time = context.user_data["reminder_time"]
-
-        async with Database.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE users
-                SET reminder_enabled = TRUE,
-                    reminder_days = $1,
-                    reminder_time = $2,
-                    reminder_duration = $3
-                WHERE user_id = $4
-                """,
-                days, t, str(dur_min), user_id
-            )
-
-        _schedule_reminders(context, user_id, days, t, dur_min)
-        context.user_data["awaiting_reminder_duration"] = False
-        await update.message.reply_text(
-            f"✅ Анкета сохранена. Напоминания включены на {dur_min} минут.",
-            reply_markup=main_keyboard()
-        )
-        return
-
-    # 6) Всё прочее
-    await update.message.reply_text("⚠️ Неизвестный текст. Используйте меню или команды.")
-
-# --------- Планировщик напоминаний ---------
-def _schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: list[str], t: time, dur: int):
+def _schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: List[str], t: time, dur_min: int) -> None:
+    """
+    Ставит джобы на старт/середину/конец тренировки. Сносит предыдущие джобы пользователя.
+    Учитывает переход через полночь (mid/end могут быть на следующий день).
+    """
     jq = getattr(context.application, "job_queue", None)
     if jq is None:
         logger.warning("JobQueue is not available; skipping reminders for user %s", user_id)
@@ -563,90 +251,604 @@ def _schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: 
     except Exception as e:
         logger.exception("Failed to list/remove jobs: %s", e)
 
-    mid_time = (datetime.combine(datetime.now().date(), t) + timedelta(minutes=dur // 2)).time()
-    end_time = (datetime.combine(datetime.now().date(), t) + timedelta(minutes=dur)).time()
+    if not days:
+        logger.info("[sched] user=%s: no days, skip scheduling", user_id)
+        return
 
-    async def _create_new_task_and_prompt(ctx: ContextTypes.DEFAULT_TYPE, phase_text: str):
-        """
-        ВСЕГДА создаёт новое задание (даже если было старое),
-        сохраняет в БД и ставит как активное, затем просит фото.
-        """
+    base_dt = datetime.combine(datetime.now().date(), t)
+    mid_time = (base_dt + timedelta(minutes=max(dur_min // 2, 1))).time()
+    end_time = (base_dt + timedelta(minutes=dur_min)).time()
+
+    day_index = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6}
+    valid_days = tuple(day_index[d] for d in days if d in day_index)
+
+    days_start = valid_days
+    days_mid = valid_days if (mid_time > t) else _shift_days(valid_days, 1)
+    days_end = valid_days if (end_time > t) else _shift_days(valid_days, 1)
+
+    logger.info("[sched] user=%s: start=%s mid=%s end=%s days_start=%s days_mid=%s days_end=%s dur=%s",
+                user_id, t, mid_time, end_time, days_start, days_mid, days_end, dur_min)
+
+    async def start_cb(ctx: ContextTypes.DEFAULT_TYPE):
+        _set_session_active(ctx, user_id, True)
         try:
-            # 1) тянем программу
-            async with Database.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT training_program FROM users WHERE user_id = $1",
-                    user_id
-                )
-
-            if not row or not row["training_program"]:
-                await ctx.bot.send_message(
-                    chat_id=user_id,
-                    text=f"{phase_text}\n(нет сохранённой программы — отправь её текстом командой /start)"
-                )
-                return
-
-            training_program = row["training_program"]
-
-            # 2) генерим новое задание
-            task_text = await generate_gpt_task(training_program)
-
-            # 3) пишем в БД
-            async with Database.acquire() as conn:
-                task_id = await conn.fetchval(
-                    """
-                    INSERT INTO tasks (user_id, task_text, status)
-                    VALUES ($1,$2,'issued')
-                    RETURNING task_id
-                    """,
-                    user_id, task_text
-                )
-
-            # 4) делаем его активным (перезаписываем старое)
-            ud = ctx.application.bot_data.setdefault("user_tasks", {})
-            ud[user_id] = {
-                "current_task": task_text,
-                "current_task_id": task_id
-            }
-
-            # 5) отправляем пользователю
             await ctx.bot.send_message(
                 chat_id=user_id,
-                text=(f"{phase_text}\n\n"
-                      f"📋 Новое задание: {task_text}\n\n"
-                      "Нажми ‘📸 Сделать фото’ — камера откроется и через 3 сек. я сделаю кадр автоматически.")
+                text="🏁 Старт тренировки! Жми «▶️ Начать подход». Фото сделаю через 10–30 сек автоматически.",
+                reply_markup=_make_keyboard(True, user_id)
             )
         except Exception as e:
-            logger.exception("_create_new_task_and_prompt failed for user %s: %s", user_id, e)
+            logger.exception("Failed to send START reminder to %s: %s", user_id, e)
+
+    async def mid_cb(ctx: ContextTypes.DEFAULT_TYPE):
+        _set_session_active(ctx, user_id, True)  # поддерживаем активность
+        try:
+            await ctx.bot.send_message(
+                chat_id=user_id,
+                text="⏳ Середина тренировки — контрольный подход. «▶️ Начать подход» (фото через 10–30 сек).",
+                reply_markup=_make_keyboard(True, user_id)
+            )
+        except Exception as e:
+            logger.exception("Failed to send MID reminder to %s: %s", user_id, e)
+
+    async def end_cb(ctx: ContextTypes.DEFAULT_TYPE):
+        _set_session_active(ctx, user_id, False)
+        try:
+            await ctx.bot.send_message(
+                chat_id=user_id,
+                text="✅ Конец тренировки — финальное подтверждение.",
+                reply_markup=_make_keyboard(False, user_id)
+            )
+        except Exception as e:
+            logger.exception("Failed to send END reminder to %s: %s", user_id, e)
+
+    if not valid_days:
+        logger.info("[sched] user=%s: valid_days empty, skip scheduling", user_id)
+        return
+
+    jq.run_daily(start_cb, time=t,        days=days_start, name=f"{user_id}:start")
+    jq.run_daily(mid_cb,   time=mid_time, days=days_mid,   name=f"{user_id}:mid")
+    jq.run_daily(end_cb,   time=end_time, days=days_end,   name=f"{user_id}:end")
+
+# Подхват настроек из БД и переустановка джобов
+async def _reschedule_from_db(update_or_context, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    try:
+        async with Database.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT reminder_enabled, reminder_days, reminder_time, workout_duration
+                  FROM users
+                 WHERE user_id = $1
+                """,
+                user_id
+            )
+        if not row:
+            logger.info("[sched] user=%s: no user row", user_id)
+            return
+        if not row["reminder_enabled"]:
+            jq = getattr(context.application, "job_queue", None)
+            if jq:
+                for job in jq.jobs():
+                    if (job.name or "").startswith(f"{user_id}:"):
+                        job.schedule_removal()
+            _set_session_active(context, user_id, False)
+            logger.info("[sched] user=%s: reminders disabled, jobs removed", user_id)
+            return
+
+        days = list(row["reminder_days"] or [])
+        rtime: Optional[time] = row["reminder_time"]
+        dur = int(row["workout_duration"] or 60)
+        logger.info("[sched] user=%s: reschedule days=%s time=%s dur=%s", user_id, days, rtime, dur)
+        if rtime:
+            _schedule_reminders(context, user_id, days, rtime, dur)
+    except Exception as e:
+        logger.exception("_reschedule_from_db failed for user %s: %s", user_id, e)
+
+# ---------------- Хендлеры ----------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Регистрация = только мастер расписания. Камера не нужна."""
+    message = update.message or update.callback_query.message
+    user = update.effective_user
+
+    async with Database.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, reminder_enabled FROM users WHERE user_id=$1",
+            user.id
+        )
+        if not row:
+            await conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name)
+                VALUES ($1,$2,$3,$4)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                user.id, user.username, user.first_name, user.last_name
+            )
+            row = {"reminder_enabled": False}
+            logger.info("[start] user=%s: created user row", user.id)
+
+    if not (row.get("reminder_enabled") if isinstance(row, dict) else row["reminder_enabled"]):
+        context.user_data.clear()
+        context.user_data["awaiting_reminder_days"] = True
+        await message.reply_text(
+            "🗓️ В какие дни тренируешься? Можно нажать кнопку или вписать:\n"
+            "• «пн ср пт»  • «вт чт сб»  • «пн-пт»  • «каждый день»  • «сб вс»  • «без расписания»",
+            reply_markup=_make_keyboard(False, user.id),
+        )
+        await message.reply_text("Выбери дни расписания:", reply_markup=days_keyboard())
+        return
+
+    await _reschedule_from_db(update, context, user.id)
+    await message.reply_text(
+        "Готово! Используй кнопки ниже.",
+        reply_markup=_current_keyboard(context, user.id)
+    )
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Роутер мастера расписания + админ-кнопки."""
+    message = update.message
+    if not message or not message.text:
+        await (update.effective_message or message).reply_text(
+            "Не понял. Нажми кнопку ниже.",
+            reply_markup=_current_keyboard(context, update.effective_user.id)
+        )
+        return
+
+    msg = message.text.strip()
+    low = msg.lower()
+    user = update.effective_user
+
+    # Админ: ручной старт/стоп режима
+    if _is_admin(user.id):
+        if low in ("🟢 старт тренировки (админ)", "старт тренировки", "🟢 старт тренировки", "/start_workout"):
+            _set_session_active(context, user.id, True)
+            logger.info("[admin] user=%s: manual START workout", user.id)
+            await message.reply_text("🚀 Режим тренировки включён (админ). Жми «▶️ Начать подход». Фото сделаю через 10–30 сек.",
+                                     reply_markup=_make_keyboard(True, user.id))
+            return
+        if low in ("🔴 стоп тренировки (админ)", "стоп тренировки", "🔴 стоп тренировки", "/end_workout"):
+            _set_session_active(context, user.id, False)
+            logger.info("[admin] user=%s: manual STOP workout", user.id)
+            await message.reply_text("🛑 Режим тренировки выключен (админ).",
+                                     reply_markup=_make_keyboard(False, user.id))
+            return
+
+    # Мастер: шаг дни
+    if context.user_data.get("awaiting_reminder_days"):
+        days = _parse_days(msg)
+        logger.info("[wizard] user=%s: days parsed=%s", user.id, days)
+
+        # без расписания — отключаем напоминания
+        if not days:
+            async with Database.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE users
+                       SET reminder_enabled = FALSE,
+                           reminder_days = $2,
+                           reminder_time = NULL,
+                           workout_duration = NULL
+                     WHERE user_id = $1
+                    """,
+                    user.id, days
+                )
+            await _reschedule_from_db(update, context, user.id)
+            _set_session_active(context, user.id, False)
+            context.user_data.clear()
+            await message.reply_text(
+                "🔕 Напоминания отключены. Когда начнёшь — просто тренируйся.",
+                reply_markup=_make_keyboard(False, user.id)
+            )
+            return
+
+        context.user_data["reminder_days"] = days
+        context.user_data.pop("awaiting_reminder_days", None)
+        context.user_data["awaiting_reminder_time"] = True
+        await message.reply_text(
+            "⏰ Во сколько напоминать? Например 07:00, 19:30 или нажми кнопку.",
+            reply_markup=time_keyboard()
+        )
+        return
+
+    # Мастер: шаг время
+    if context.user_data.get("awaiting_reminder_time"):
+        if low == "другое время":
+            await message.reply_text(
+                "Введи время в формате ЧЧ:ММ, например 19:30.",
+                reply_markup=time_keyboard()
+            )
+            return
+
+        t = _parse_time_hhmm(msg)
+        if not t:
+            await message.reply_text(
+                "Не понял время. Введи в формате ЧЧ:ММ (например, 08:00).",
+                reply_markup=time_keyboard()
+            )
+            return
+        context.user_data["reminder_time"] = t
+        context.user_data.pop("awaiting_reminder_time", None)
+
+        context.user_data["awaiting_reminder_duration"] = True
+        await message.reply_text(
+            "⏱️ Введи длительность тренировки в минутах (5–240) или выбери кнопку.",
+            reply_markup=duration_keyboard()
+        )
+        return
+
+    # Мастер: шаг длительность
+    if context.user_data.get("awaiting_reminder_duration"):
+        digits = re.findall(r"\d+", msg)
+        if not digits:
+            await message.reply_text(
+                "Введи число минут (от 5 до 240), например: 5, 30, 95.",
+                reply_markup=duration_keyboard()
+            )
+            return
+        dur = int(digits[0])
+        if not (5 <= dur <= 240):
+            await message.reply_text(
+                "Поддерживаю длительность от 5 до 240 минут. Введи число в этом диапазоне.",
+                reply_markup=duration_keyboard()
+            )
+            return
+
+        context.user_data["workout_duration"] = dur
+        context.user_data.pop("awaiting_reminder_duration", None)
+
+        days = context.user_data.get("reminder_days", [])
+        t = context.user_data.get("reminder_time")
+
+        async with Database.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                   SET reminder_enabled = TRUE,
+                       reminder_days = $2,
+                       reminder_time = $3,
+                       workout_duration = $4
+                 WHERE user_id = $1
+                """,
+                user.id, days, t, dur
+            )
+
+        _schedule_reminders(context, user.id, days, t, dur)
+        context.user_data.clear()
+
+        await message.reply_text(
+            f"✅ Напоминания включены.\n"
+            f"Дни: {_human_days(days)}\n"
+            f"Время: {t.strftime('%H:%M')}\n"
+            f"Длительность: {dur} мин.",
+            reply_markup=_make_keyboard(False, user.id)  # кнопка появится на старте или по админ-старту
+        )
+        return
+
+    # Прочее
+    if low in ("профиль", "📊 профиль"):
+        await profile(update, context)
+        return
+
+    await message.reply_text("Не понял. Нажми кнопку ниже.",
+                             reply_markup=_current_keyboard(context, user.id))
+
+async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Явный перезапуск мастера настройки напоминаний."""
+    message = update.message or update.callback_query.message
+    context.user_data.clear()
+    context.user_data["awaiting_reminder_days"] = True
+    await message.reply_text(
+        "🗓️ Обновим расписание. В какие дни тренируешься?\n"
+        "• «пн ср пт»  • «вт чт сб»  • «пн-пт»  • «каждый день»  • «сб вс»  • «без расписания»",
+        reply_markup=days_keyboard(),
+    )
+
+# ---------------- Приём данных из WebApp ----------------
+async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Поддерживаем:
+      1) Финальный пакет:  {"type":"workout_set","tokens":["t1"], "timestamps":[...]}  # ОДНО фото (новый режим)
+      2) Потоковые события: {"type":"single_photo_uploaded","token":"t1"} / {"type":"set_photo_uploaded","token":"t1"}
+      3) (совместимость) три фото: {"type":"workout_set","tokens":["t1","t2","t3"], "window":180, "timestamps":[...]}
+    """
+    if not update.message or not update.message.web_app_data:
+        return
+    try:
+        raw = update.message.web_app_data.data
+        logger.info("[webapp] raw length=%s", len(raw) if raw is not None else None)
+        payload = json.loads(raw)
+    except Exception:
+        logger.exception("[webapp] failed to parse web_app_data JSON")
+        return
+
+    ptype = str(payload.get("type"))
+
+    # --- Потоковое одиночное событие: сразу проверяем 1 фото ---
+    if ptype in ("single_photo_uploaded", "set_photo_uploaded"):
+        user = update.effective_user
+        token = payload.get("token") or payload.get("t") or payload.get("id")
+        if not token:
+            logger.warning("[webapp] user=%s %s without token", user.id, ptype)
+            return
+        logger.info("[webapp] user=%s single upload token=%s", user.id, _mask_token(token))
+
+        # Скачиваем фото
+        try:
+            async with aiohttp.ClientSession() as sess:
+                pull_url = settings.make_pull_url(token)
+                async with sess.get(pull_url, timeout=30) as r:
+                    if r.status != 200:
+                        raise RuntimeError(f"HTTP {r.status}")
+                    photo_bytes = await r.read()
+            logger.info("[webapp] user=%s single photo size=%d", user.id, len(photo_bytes))
+        except Exception as e:
+            logger.exception("[webapp] user=%s fail pull single photo token=%s: %s", user.id, _mask_token(token), e)
+            await update.message.reply_text("⚠️ Не удалось получить фото. Попробуй ещё раз.")
+            return
+
+        # Проверка фото
+        ok = await _save_training_photo(user.id, photo_bytes, context.bot)
+        if ok:
+            await update.message.reply_text("🏆 Подход засчитан (1 фото).")
+        else:
+            await update.message.reply_text("❌ Подход не засчитан (1 фото не прошло проверку).")
+        return
+
+    # --- Финальный пакет ---
+    if ptype != "workout_set":
+        logger.info("[webapp] skip payload type=%r", ptype)
+        return
+
+    user = update.effective_user
+    tokens = payload.get("tokens") or payload.get("photos") or []
+    window = int(payload.get("window") or 180)
+    ts = payload.get("timestamps") or []
+
+    logger.info("[webapp] user=%s type=workout_set window=%s tokens=%s ts_count=%s",
+                user.id, window, [_mask_token(t) for t in tokens], (len(ts) if isinstance(ts, list) else 0))
+
+    # Новый режим: одно фото внутри workout_set
+    if len(tokens) == 1:
+        token = tokens[0]
+        # Скачиваем фото
+        try:
+            async with aiohttp.ClientSession() as sess:
+                pull_url = settings.make_pull_url(token)
+                async with sess.get(pull_url, timeout=30) as r:
+                    if r.status != 200:
+                        raise RuntimeError(f"HTTP {r.status}")
+                    photo_bytes = await r.read()
+            logger.info("[webapp] user=%s single-in-set photo size=%d", user.id, len(photo_bytes))
+        except Exception as e:
+            logger.exception("[webapp] user=%s fail pull single-in-set token=%s: %s", user.id, _mask_token(token), e)
+            await update.message.reply_text("⚠️ Не удалось получить фото. Попробуй ещё раз.")
+            return
+
+        ok = await _save_training_photo(user.id, photo_bytes, context.bot)
+        if ok:
+            await update.message.reply_text("🏆 Подход засчитан (1 фото).")
+        else:
+            await update.message.reply_text("❌ Подход не засчитан (1 фото не прошло проверку).")
+        return
+
+    # Совместимость: старый режим на 3 фото
+    if len(tokens) != 3:
+        await update.message.reply_text("⚠️ Ожидаю или 1 фото, или 3 фото.")
+        logger.warning("[webapp] user=%s wrong tokens count=%s", user.id, len(tokens))
+        return
+
+    # 3 фото — старый путь
+    photos_bytes: List[bytes] = []
+    async with aiohttp.ClientSession() as sess:
+        for idx, tok in enumerate(tokens, start=1):
             try:
-                await ctx.bot.send_message(chat_id=user_id, text=f"{phase_text}\n(ошибка генерации задания)")
+                pull_url = settings.make_pull_url(tok)
+                async with sess.get(pull_url, timeout=30) as r:
+                    status = r.status
+                    if status != 200:
+                        logger.warning("[webapp] user=%s photo %d/%d token=%s HTTP %s",
+                                       user.id, idx, len(tokens), _mask_token(tok), status)
+                        raise RuntimeError(f"HTTP {status}")
+                    data = await r.read()
+                    photos_bytes.append(data)
+                    logger.info("[webapp] user=%s photo %d/%d token=%s size=%d",
+                                user.id, idx, len(tokens), _mask_token(tok), len(data))
+            except Exception as e:
+                logger.exception("[webapp] user=%s fail pull photo %d/%d token=%s: %s",
+                                 user.id, idx, len(tokens), _mask_token(tok), e)
+                await update.message.reply_text("⚠️ Не удалось получить фото. Попробуй ещё раз.")
+                return
+
+    logger.info("[webapp] user=%s all photos pulled count=%d", user.id, len(photos_bytes))
+
+    # Валидация третей (если timestamps есть)
+    thirds_ok = True
+    if isinstance(ts, list) and len(ts) == 3:
+        def _to_ts(x):
+            try:
+                if isinstance(x, (int, float)):
+                    return float(x)
+                return datetime.fromisoformat(str(x).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return None
+
+        t_vals = list(map(_to_ts, ts))
+        if any(v is None for v in t_vals):
+            thirds_ok = False
+            logger.info("[webapp] user=%s thirds check: timestamps parse failed %r", user.id, ts)
+        else:
+            t_vals.sort()
+            total = t_vals[-1] - t_vals[0]
+            if total <= 0:
+                thirds_ok = False
+                logger.info("[webapp] user=%s thirds check: non-positive total=%s", user.id, total)
+            else:
+                target_segment = window / 3.0
+                tol = max(10.0, target_segment * 0.4)
+                d1 = t_vals[1] - t_vals[0]
+                d2 = t_vals[2] - t_vals[1]
+                thirds_ok = (abs(d1 - target_segment) <= tol) and (abs(d2 - target_segment) <= tol)
+                logger.info("[webapp] user=%s thirds d1=%.2f d2=%.2f target=%.2f tol=%.2f -> thirds_ok=%s",
+                            user.id, d1, d2, target_segment, tol, thirds_ok)
+
+    results = []
+    for i, pb in enumerate(photos_bytes, start=1):
+        ok = await _save_training_photo(user.id, pb, context.bot)
+        results.append(ok)
+        logger.info("[webapp] user=%s photo %d verify=%s", user.id, i, ok)
+
+    logger.info("[webapp] user=%s set summary results=%s thirds_ok=%s", user.id, results, thirds_ok)
+
+    if all(results) and thirds_ok:
+        await update.message.reply_text("🏆 Подход засчитан: 3/3 фото, корректные трети и домашняя тренировка.")
+    elif all(results) and not thirds_ok:
+        await update.message.reply_text("✅ Фото ок, но интервалы третей не совпали с окном. Постарайся держать равные интервалы.")
+    else:
+        passed = sum(1 for x in results if x)
+        tip = "" if thirds_ok else " и интервалы третей некорректны"
+        await update.message.reply_text(f"❌ Подход не засчитан: {passed}/3 фото прошло{tip}.")
+
+# ---------------- Админ-команды ----------------
+async def delete_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not _is_admin(user.id):
+        await update.effective_message.reply_text("🚫 Доступ запрещён.", reply_markup=_current_keyboard(context, user.id))
+        return
+    try:
+        await Database.drop()
+        await Database.init()
+        jq = getattr(context.application, "job_queue", None)
+        if jq:
+            for job in jq.jobs():
+                job.schedule_removal()
+        context.application.bot_data["session_active"] = {}
+        await update.effective_message.reply_text("🗑️ База данных удалена и пересоздана.", reply_markup=_make_keyboard(False, user.id))
+        logger.info("[admin] user=%s: /delete_db done", user.id)
+    except Exception as e:
+        logger.exception("/delete_db failed: %s", e)
+        await update.effective_message.reply_text("⚠️ Ошибка при удалении БД.", reply_markup=_make_keyboard(False, user.id))
+
+async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not _is_admin(user.id):
+        await update.effective_message.reply_text("🚫 Доступ запрещён.", reply_markup=_current_keyboard(context, user.id))
+        return
+    try:
+        async with Database.acquire() as conn:
+            try:
+                await conn.execute("TRUNCATE TABLE tasks RESTART IDENTITY CASCADE")
+            except Exception:
+                pass
+            try:
+                await conn.execute("TRUNCATE TABLE sets RESTART IDENTITY CASCADE")
+            except Exception:
+                pass
+            try:
+                await conn.execute(
+                    """
+                    UPDATE users
+                       SET reminder_enabled = FALSE,
+                           reminder_days = ARRAY[]::text[],
+                           reminder_time = NULL,
+                           workout_duration = NULL
+                    """
+                )
             except Exception:
                 pass
 
-    async def start_cb(ctx: ContextTypes.DEFAULT_TYPE):
-        await _create_new_task_and_prompt(ctx, "🏁 Старт тренировки!")
+        jq = getattr(context.application, "job_queue", None)
+        if jq:
+            for job in jq.jobs():
+                job.schedule_removal()
+        context.application.bot_data["session_active"] = {}
 
-    async def mid_cb(ctx: ContextTypes.DEFAULT_TYPE):
-        await _create_new_task_and_prompt(ctx, "⏳ Середина тренировки — контрольное задание.")
+        await update.effective_message.reply_text("🧹 Данные очищены. Напоминания выключены у всех.", reply_markup=_make_keyboard(False, user.id))
+        logger.info("[admin] user=%s: /clear_db done", user.id)
+    except Exception as e:
+        logger.exception("/clear_db failed: %s", e)
+        await update.effective_message.reply_text("⚠️ Ошибка при очистке данных.", reply_markup=_make_keyboard(False, user.id))
 
-    async def end_cb(ctx: ContextTypes.DEFAULT_TYPE):
-        await _create_new_task_and_prompt(ctx, "✅ Конец тренировки — финальное задание.")
+# Дополнительно: команды для ручного старта/стопа
+async def start_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not _is_admin(user.id):
+        await update.effective_message.reply_text("🚫 Доступ запрещён.", reply_markup=_current_keyboard(context, user.id))
+        return
+    _set_session_active(context, user.id, True)
+    logger.info("[admin] user=%s: /start_workout", user.id)
+    await update.effective_message.reply_text("🚀 Режим тренировки включён (админ). Жми «▶️ Начать подход». Фото сделаю через 10–30 сек.",
+                                              reply_markup=_make_keyboard(True, user.id))
 
-    day_index = {'mon':0,'tue':1,'wed':2,'thu':3,'fri':4,'sat':5,'sun':6}
-    for d in days:
-        if d not in day_index:
-            continue
-        wd = day_index[d]
-        jq.run_daily(start_cb, time=t,        days=(wd,), name=f"{user_id}:start:{d}")
-        jq.run_daily(mid_cb,   time=mid_time, days=(wd,), name=f"{user_id}:mid:{d}")
-        jq.run_daily(end_cb,   time=end_time, days=(wd,), name=f"{user_id}:end:{d}")
+async def end_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not _is_admin(user.id):
+        await update.effective_message.reply_text("🚫 Доступ запрещён.", reply_markup=_current_keyboard(context, user.id))
+        return
+    _set_session_active(context, user.id, False)
+    logger.info("[admin] user=%s: /end_workout", user.id)
+    await update.effective_message.reply_text("🛑 Режим тренировки выключен (админ).",
+                                              reply_markup=_make_keyboard(False, user.id))
 
-    logger.info("Scheduled reminders+new-tasks for user=%s days=%s at=%s dur=%s min", user_id, days, t, dur)
+# ---------------- Профиль ----------------
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message or update.callback_query.message
+    user = update.effective_user
 
+    total_tasks = 0
+    completed_tasks = 0
+    reminder_enabled = False
+    days = []
+    rtime: Optional[time] = None
+    duration = None
 
-# --------- По желанию: команда заново настроить напоминания ---------
-async def setup_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["awaiting_reminder_days"] = True
-    await update.message.reply_text(
-        "🗓️ Обновим расписание. В какие дни тренируешься? (пн ср пт / пн-пт / каждый день)"
-    )
+    try:
+        async with Database.acquire() as conn:
+            try:
+                row_stats = await conn.fetchrow(
+                    """
+                    SELECT COUNT(*) AS total,
+                           SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed
+                      FROM tasks
+                     WHERE user_id = $1
+                    """,
+                    user.id
+                )
+                if row_stats:
+                    total_tasks = int(row_stats["total"] or 0)
+                    completed_tasks = int(row_stats["completed"] or 0)
+            except Exception:
+                pass  # таблицы может не быть — ок
+
+            row_user = await conn.fetchrow(
+                """
+                SELECT reminder_enabled, reminder_days, reminder_time, workout_duration
+                  FROM users
+                 WHERE user_id = $1
+                """,
+                user.id
+            )
+            if row_user:
+                reminder_enabled = bool(row_user["reminder_enabled"])
+                days = list(row_user["reminder_days"] or [])
+                rtime = row_user["reminder_time"]
+                duration = row_user["workout_duration"]
+
+    except Exception as e:
+        logger.exception("profile() failed: %s", e)
+
+    percent = 0
+    if total_tasks:
+        percent = int((completed_tasks / total_tasks) * 100) if total_tasks else 0
+
+    text = [
+        f"👤 Профиль @{user.username or user.id}",
+        f"Задач: {total_tasks}, выполнено: {completed_tasks} ({percent}%)",
+        "",
+        "🔔 Напоминания: " + ("включены" if reminder_enabled else "выключены"),
+        "Дни: " + _human_days(days),
+        "Время: " + (rtime.strftime('%H:%M') if rtime else "—"),
+        "Длительность: " + (f"{duration} мин." if duration else "—"),
+        "",
+        "Режим тренировки: " + ("активен" if _is_session_active(context, user.id) else "выключен"),
+    ]
+    await message.reply_text("\n".join(text), reply_markup=_current_keyboard(context, user.id))

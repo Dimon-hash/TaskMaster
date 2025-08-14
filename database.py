@@ -59,27 +59,35 @@ class Database:
                     last_name TEXT,
                     face_features BYTEA,
                     face_photo BYTEA,
-                    registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    training_program TEXT,
+                    training_form JSONB,
+                    reminder_enabled BOOLEAN DEFAULT FALSE,
+                    reminder_time TIME,
+                    reminder_days TEXT[],
+                    -- legacy: раньше так хранили длительность
+                    reminder_duration TEXT,
+                    -- актуальная длительность в минутах
+                    workout_duration INT
                 )
             """)
+
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS public.tasks (
-                    task_id SERIAL PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS public.sets (
+                    set_id SERIAL PRIMARY KEY,
                     user_id BIGINT REFERENCES public.users(user_id) ON DELETE CASCADE,
-                    task_text TEXT,
-                    status TEXT,
-                    completion_date TIMESTAMP,
-                    verification_photo BYTEA
+                    photo BYTEA,
+                    verified BOOLEAN DEFAULT FALSE,
+                    gpt_reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
             # Миграции (идемпотентно)
             await cls._run_migrations(conn)
 
-            db, usr, schema = await conn.fetchrow(
-                "SELECT current_database(), current_user, current_schema()"
-            )
-            logger.info("DB connected: db=%s user=%s schema=%s", db, usr, schema)
+            row = await conn.fetchrow("SELECT current_database() AS db, current_user AS usr, current_schema() AS sch")
+            logger.info("DB connected: db=%s user=%s schema=%s", row["db"], row["usr"], row["sch"])
 
         logger.info("Database initialized successfully.")
 
@@ -100,24 +108,24 @@ class Database:
 
     @classmethod
     async def truncate_all(cls) -> None:
-        """Очищает данные, оставляет структуру (сброс identity). Отдельное соединение, не из пула."""
+        """Очищает данные, оставляет структуру (сброс identity)."""
         conn = await asyncpg.connect(dsn=str(settings.DATABASE_URL))
         try:
             await conn.execute("SET search_path TO public")
-            await conn.execute("TRUNCATE TABLE public.tasks, public.users RESTART IDENTITY CASCADE")
-            logger.info("All tables truncated (users/tasks).")
+            await conn.execute("TRUNCATE TABLE public.sets, public.users RESTART IDENTITY CASCADE")
+            logger.info("All tables truncated (users/sets).")
         finally:
             await conn.close()
 
     @classmethod
     async def drop_all(cls) -> None:
-        """Удаляет таблицы. Отдельное соединение, чтобы не ловить reset на release()."""
+        """Удаляет таблицы."""
         conn = await asyncpg.connect(dsn=str(settings.DATABASE_URL))
         try:
             await conn.execute("SET search_path TO public")
-            await conn.execute("DROP TABLE IF EXISTS public.tasks CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS public.sets CASCADE")
             await conn.execute("DROP TABLE IF EXISTS public.users CASCADE")
-            logger.info("All tables dropped (users/tasks).")
+            logger.info("All tables dropped (users/sets).")
         finally:
             await conn.close()
 
@@ -134,29 +142,40 @@ class Database:
     @classmethod
     async def _run_migrations(cls, conn: asyncpg.Connection) -> None:
         """
-        Здесь — идемпотентные миграции. Добавляй новые ALTER’ы вниз.
+        Идемпотентные миграции для совместимости со старыми версиями.
+        Добавляй новые ALTER’ы вниз.
         """
-        # 1) training_program
+        # users — добиваем недостающие поля
         await conn.execute("""
             ALTER TABLE public.users
-            ADD COLUMN IF NOT EXISTS training_program TEXT
-        """)
-        # 2) Анкета и напоминания
-        await conn.execute("""
-            ALTER TABLE public.users
+            ADD COLUMN IF NOT EXISTS training_program TEXT,
             ADD COLUMN IF NOT EXISTS training_form JSONB,
             ADD COLUMN IF NOT EXISTS reminder_enabled BOOLEAN DEFAULT FALSE,
             ADD COLUMN IF NOT EXISTS reminder_time TIME,
             ADD COLUMN IF NOT EXISTS reminder_days TEXT[],
-            ADD COLUMN IF NOT EXISTS reminder_duration TEXT
+            ADD COLUMN IF NOT EXISTS reminder_duration TEXT,
+            ADD COLUMN IF NOT EXISTS workout_duration INT
         """)
+
+        # sets — добиваем недостающие поля
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS public.sets (
+                set_id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES public.users(user_id) ON DELETE CASCADE,
+                photo BYTEA,
+                verified BOOLEAN DEFAULT FALSE,
+                gpt_reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.execute("ALTER TABLE public.sets ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE public.sets ADD COLUMN IF NOT EXISTS gpt_reason TEXT")
+        await conn.execute("ALTER TABLE public.sets ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
     @classmethod
     async def drop(cls):
-        # alias для совместимости со старым кодом
         await cls.drop_all()
 
     @classmethod
     async def truncate(cls):
-        # alias для совместимости со старым кодом
         await cls.truncate_all()

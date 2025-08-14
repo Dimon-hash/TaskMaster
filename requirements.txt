@@ -1,0 +1,12 @@
+python-telegram-bot>=20.0a0
+asyncpg
+opencv-python-headless
+numpy
+python-dotenv
+aiofiles
+openai
+backoff
+pydantic
+aiogram
+pydantic-settings
+httpx
