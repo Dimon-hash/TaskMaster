@@ -13,6 +13,9 @@ from database import Database
 from gpt_tasks import verify_task_with_gpt  # опционально, используем для фото-проверки сетов
 from config import settings
 
+from zoneinfo import ZoneInfo
+APP_TZ = ZoneInfo(getattr(settings, "TIMEZONE", "Europe/Moscow"))
+
 logger = logging.getLogger(__name__)
 
 # ---------------- Утилиты ----------------
@@ -232,12 +235,10 @@ def _is_session_active(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool
 def _shift_days(days_tuple: tuple[int, ...], offset: int) -> tuple[int, ...]:
     """Сдвиг дней недели (0..6) на offset вперёд, с модулем 7."""
     return tuple(((d + offset) % 7) for d in days_tuple)
+from zoneinfo import ZoneInfo
+APP_TZ = ZoneInfo(getattr(settings, "TIMEZONE", "Europe/Moscow"))
 
 def _schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: List[str], t: time, dur_min: int) -> None:
-    """
-    Ставит джобы на старт/середину/конец тренировки. Сносит предыдущие джобы пользователя.
-    Учитывает переход через полночь (mid/end могут быть на следующий день).
-    """
     jq = getattr(context.application, "job_queue", None)
     if jq is None:
         logger.warning("JobQueue is not available; skipping reminders for user %s", user_id)
@@ -255,19 +256,26 @@ def _schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: 
         logger.info("[sched] user=%s: no days, skip scheduling", user_id)
         return
 
-    base_dt = datetime.combine(datetime.now().date(), t)
-    mid_time = (base_dt + timedelta(minutes=max(dur_min // 2, 1))).time()
-    end_time = (base_dt + timedelta(minutes=dur_min)).time()
+    # tz-aware время в APP_TZ
+    t_z = time(t.hour, t.minute, t.second, t.microsecond, tzinfo=APP_TZ)
+    base_dt = datetime.combine(datetime.now(APP_TZ).date(), t_z)
+    mid_time = (base_dt + timedelta(minutes=max(dur_min // 2, 1))).timetz()
+    end_time = (base_dt + timedelta(minutes=dur_min)).timetz()
 
+    # PTB: ПН=0 ... ВС=6
     day_index = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6}
-    valid_days = tuple(day_index[d] for d in days if d in day_index)
+    valid_days_raw = tuple(day_index[d] for d in days if d in day_index)
 
+    # ВАШ СДВИГ: «день раньше»
+    valid_days = _shift_days(valid_days_raw, 1)
+
+    # Если середина/конец уходят за полночь — переносим на след. день
     days_start = valid_days
-    days_mid = valid_days if (mid_time > t) else _shift_days(valid_days, 1)
-    days_end = valid_days if (end_time > t) else _shift_days(valid_days, 1)
+    days_mid = valid_days if (mid_time > t_z) else _shift_days(valid_days, 1)
+    days_end = valid_days if (end_time > t_z) else _shift_days(valid_days, 1)
 
-    logger.info("[sched] user=%s: start=%s mid=%s end=%s days_start=%s days_mid=%s days_end=%s dur=%s",
-                user_id, t, mid_time, end_time, days_start, days_mid, days_end, dur_min)
+    logger.info("[sched] user=%s: start=%s mid=%s end=%s tz=%s days_start=%s days_mid=%s days_end=%s dur=%s",
+                user_id, t_z, mid_time, end_time, APP_TZ, days_start, days_mid, days_end, dur_min)
 
     async def start_cb(ctx: ContextTypes.DEFAULT_TYPE):
         _set_session_active(ctx, user_id, True)
@@ -281,7 +289,7 @@ def _schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: 
             logger.exception("Failed to send START reminder to %s: %s", user_id, e)
 
     async def mid_cb(ctx: ContextTypes.DEFAULT_TYPE):
-        _set_session_active(ctx, user_id, True)  # поддерживаем активность
+        _set_session_active(ctx, user_id, True)
         try:
             await ctx.bot.send_message(
                 chat_id=user_id,
@@ -306,9 +314,13 @@ def _schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, days: 
         logger.info("[sched] user=%s: valid_days empty, skip scheduling", user_id)
         return
 
-    jq.run_daily(start_cb, time=t,        days=days_start, name=f"{user_id}:start")
+    jq.run_daily(start_cb, time=t_z,      days=days_start, name=f"{user_id}:start")
     jq.run_daily(mid_cb,   time=mid_time, days=days_mid,   name=f"{user_id}:mid")
     jq.run_daily(end_cb,   time=end_time, days=days_end,   name=f"{user_id}:end")
+
+    for job in jq.jobs():
+        if (job.name or "").startswith(f"{user_id}:"):
+            logger.info("[sched] %s next_run=%s", job.name, job.next_run_time)
 
 # Подхват настроек из БД и переустановка джобов
 async def _reschedule_from_db(update_or_context, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
@@ -840,8 +852,13 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if total_tasks:
         percent = int((completed_tasks / total_tasks) * 100) if total_tasks else 0
 
+    now_local = datetime.now(APP_TZ)
+    tz_label = getattr(APP_TZ, "key", str(APP_TZ))  # Europe/Moscow
+    today_line = now_local.strftime(f"Сегодня: %Y-%m-%d (%A) %H:%M ({tz_label})")
+
     text = [
         f"👤 Профиль @{user.username or user.id}",
+        today_line,  # ← новая строка
         f"Задач: {total_tasks}, выполнено: {completed_tasks} ({percent}%)",
         "",
         "🔔 Напоминания: " + ("включены" if reminder_enabled else "выключены"),
