@@ -1,4 +1,3 @@
-# main.py
 import logging
 import sys
 import asyncio
@@ -10,7 +9,6 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     filters,
-    JobQueue,
     Defaults,
 )
 
@@ -46,10 +44,10 @@ def main():
     if hasattr(handlers, "handle_webapp_data"):
         app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handlers.handle_webapp_data))
 
+    # /start запускает онбординг
     app.add_handler(CommandHandler('start', handlers.start))
     app.add_handler(CommandHandler('profile', handlers.profile))
-    if hasattr(handlers, "send_photo"):
-        app.add_handler(CommandHandler('sendphoto', handlers.send_photo))
+
     if hasattr(handlers, "clear_db"):
         app.add_handler(CommandHandler("clear_db", handlers.clear_db))
     if hasattr(handlers, "delete_db"):
@@ -57,11 +55,21 @@ def main():
     if hasattr(handlers, "reminders"):
         app.add_handler(CommandHandler("reminders", handlers.reminders))
 
-    if hasattr(handlers, "handle_photo"):
-        app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handlers.handle_photo))
+    # 📸 Приём фото в онбординге: как photo и как document(image/*)
+    app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
+                                   handlers.register_photo))
+
+    # Инлайн-кнопки онбординга: выбор дней, режима длительности и депозита
+    # ВАЖНО: добавили dur_ чтобы кнопки «Да/Нет (одинаковая/разная)» работали
+    app.add_handler(CallbackQueryHandler(handlers.register_callback, pattern=r"^(day_|dep_|dur_)"))
+
+    # Кнопка "Профиль"
     app.add_handler(MessageHandler(filters.Regex("^📊 Профиль$"), handlers.profile))
+
+    # Текст: сначала онбординг, остальное — в общий роутер
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
 
+    # Совместимость: если есть своё меню
     if hasattr(handlers, "menu_callback"):
         app.add_handler(CallbackQueryHandler(handlers.menu_callback))
 

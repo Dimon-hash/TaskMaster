@@ -3,86 +3,76 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Сделать фото</title>
+  <title>Тренировка — камера</title>
   <style>
     :root{color-scheme:dark}
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0f14;color:#fff}
+    html,body{height:100%}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0f14;color:#fff;user-select:none;touch-action:none}
     .wrap{padding:16px;display:flex;flex-direction:column;gap:14px;align-items:center;max-width:520px;margin:0 auto}
     video#v{width:100%;max-width:480px;border-radius:16px;background:#000}
     canvas#c{display:none}
-
     .title{font-size:16px;opacity:.95;text-align:center}
     .pill{font-variant-numeric:tabular-nums;font-weight:700;background:#0f1620;border:1px solid #1d2732;border-radius:999px;padding:8px 12px}
-    .bar{width:100%;max-width:420px;height:10px;background:#0f1620;border-radius:999px;overflow:hidden;border:1px solid #1d2732}
-    .bar>i{display:block;height:100%;width:0%}
     .status{font-size:14px;opacity:.85;text-align:center}
     .err{color:#ff6b6b}
     .muted{opacity:.8}
-    .row{display:flex;gap:8px}
     .btn{appearance:none;border:1px solid #1d2732;background:#0f1620;color:#fff;border-radius:10px;padding:10px 14px;font-size:14px}
     .btn:active{transform:scale(0.99)}
-    .hidden{display:none}
+    #shield{position:fixed;inset:0;background:rgba(11,15,20,.6);backdrop-filter:saturate(120%) blur(2px);display:none;align-items:center;justify-content:center;z-index:9999;pointer-events:auto;cursor:wait}
+    #shield.active{display:flex}
+    #shield .msg{font-size:15px;opacity:.95;padding:12px 14px;background:#0f1620;border:1px solid #1d2732;border-radius:12px}
+    .noclick{pointer-events:none}
+    #closeBtn{display:none;margin-top:8px}
+    #closeBtn.show{display:inline-block}
   </style>
 </head>
 <body>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 
 <div class="wrap">
-  <div class="title">Подготовка…</div>
+  <div class="title">Камера готовится…</div>
   <video id="v" playsinline autoplay muted></video>
   <canvas id="c"></canvas>
 
-  <div class="pill">—</div>
-  <div class="bar"><i></i></div>
-  <div class="status muted">Дайте доступ к камере (системный запрос).</div>
+  <div class="pill">Снимки выполняются: 1 — случайно, 2 и 3 — через отдых</div>
+  <div class="status muted">Не закрывай это окно до конца тренировки.</div>
 
-  <div class="row">
-    <button id="stopBtn" class="btn hidden">⏹ Стоп</button>
-  </div>
+  <button id="closeBtn" class="btn">Закрыть</button>
 </div>
+
+<div id="shield"><div class="msg">Тренировка идёт… не закрывай окно</div></div>
 
 <script>
 (() => {
   const tg = window.Telegram?.WebApp;
   tg?.expand?.(); tg?.ready?.();
 
-  let stream = null, stopRequested = false;
+  let stream = null, wakeLock = null, keepAliveTimer = null;
+  let canClose = false;
+
   const v = document.getElementById('v');
   const c = document.getElementById('c');
   const title = document.querySelector('.title');
   const pill  = document.querySelector('.pill');
-  const fill  = document.querySelector('.bar > i');
   const status= document.querySelector('.status');
-  const stopBtn = document.getElementById('stopBtn');
+  const shield= document.getElementById('shield');
+  const closeBtn = document.getElementById('closeBtn');
 
-  // ---- параметры из query ----
   const qs = new URLSearchParams(location.search);
-  const mode      = (qs.get('mode') || 'single').toLowerCase();  // single | workout
-  const shots     = Math.max(1, Math.min(10, parseInt(qs.get('shots') || '1', 10)));
-  const windowSec = Math.max(20, Math.min(3600, parseInt(qs.get('window') || '60', 10)));
-
-  // НОВОЕ: случайная задержка для одного снимка
-  const delayMin  = Math.max(1, parseInt(qs.get('delay_min') || '10', 10));
-  const delayMax  = Math.max(delayMin, parseInt(qs.get('delay_max') || '30', 10));
-
+  const totalSec  = Math.max(60, parseInt(qs.get('window') || '3600', 10));  // вся длительность тренировки
+  const restSec   = Math.max(1,  parseInt(qs.get('rest')   || '60',   10));  // отдых между 2-м и 3-м кадром
   const inTelegram = !!(tg && (tg.platform || tg.initDataUnsafe?.user || (tg.initData && tg.initData.length)));
   const dev = qs.get('dev') === '1' || !inTelegram;
 
-  // ---- helpers ----
-  function setStatus(text, isErr=false){ status.textContent = text; status.className = 'status' + (isErr ? ' err' : ' muted'); }
-  function progress(pct){ fill.style.width = Math.max(0, Math.min(100, pct)) + '%'; }
+  // ---------- утилиты ----------
+  function setStatus(text, isErr=false){
+    status.textContent = text;
+    status.className = 'status' + (isErr ? ' err' : ' muted');
+  }
   function stopStream(){ try{ stream?.getTracks?.().forEach(t=>t.stop()); }catch(_){} stream=null; }
-  function endAndClose(delay=300){ stopStream(); setTimeout(()=>tg?.close?.(), delay); }
   const sleep = ms => new Promise(r=>setTimeout(r, ms));
-  const rndInt = (a,b)=> a + Math.floor(Math.random()*(b-a+1));
 
-  stopBtn.addEventListener('click', () => {
-    stopRequested = true;
-    setStatus('Сеанс остановлен пользователем.');
-    endAndClose(400);
-  });
-
-  function canvasToBlob(canvas, type='image/jpeg', q=0.85){
+  function canvasToBlob(canvas, type='image/jpeg', q=0.9){
     return new Promise(res=>{
       if (canvas.toBlob) return canvas.toBlob(b=>res(b), type, q);
       const dataURL = canvas.toDataURL(type, q);
@@ -93,14 +83,14 @@
     });
   }
 
-  async function captureAndSend(kind){
+  async function captureAndUploadToken(){
     const vw=v.videoWidth||720, vh=v.videoHeight||1280;
     const w=Math.min(1280,vw), h=Math.round(w*(vh/vw));
     c.width=w; c.height=h;
     const ctx = c.getContext('2d', {willReadFrequently:true});
     ctx.drawImage(v,0,0,w,h);
 
-    const blob = await canvasToBlob(c,'image/jpeg',0.85);
+    const blob = await canvasToBlob(c,'image/jpeg',0.9);
     const form = new FormData();
     form.append('photo', blob, `shot_${Date.now()}.jpg`);
     form.append('initData', inTelegram ? (tg.initData || '') : '');
@@ -113,24 +103,7 @@
     }
     const data = await r.json();
     if (!data?.token) throw new Error('No token from server');
-
-    if (inTelegram){
-      // НОВОЕ: для одиночного фото шлём single_photo_uploaded
-      const payload = {
-        type: (kind === 'single' ? 'single_photo_uploaded' : 'set_photo_uploaded'),
-        token: data.token,
-        auto: true
-      };
-      tg.sendData(JSON.stringify(payload));
-    } else {
-      console.log('DEV token:', data.token);
-    }
-  }
-
-  function randomSchedule(n, totalSec){
-    const minGap = 5; // защитный интервал
-    const times = Array.from({length:n}, () => Math.random()).sort((a,b)=>a-b);
-    return times.map(t => Math.floor(minGap + t*(Math.max(totalSec-2*minGap, minGap))));
+    return String(data.token);
   }
 
   async function ensureCamera(){
@@ -147,97 +120,142 @@
     try { await v.play(); } catch {}
   }
 
-  // ---- НОВЫЙ режим одного снимка с задержкой 10–30 сек ----
-  async function runSingle(){
-    title.textContent = 'Режим подхода — 1 снимок';
-    pill.textContent  = 'Подготовка камеры';
-    setStatus('Дай доступ к камере. Снимок будет сделан автоматически.');
-    progress(0);
-    stopBtn.classList.remove('hidden');
+  // Wake Lock + keep-alive
+  async function requestWakeLock(){
+    try{
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        document.addEventListener('visibilitychange', async () => {
+          if (document.visibilityState === 'visible') {
+            try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+          }
+        });
+      }
+    }catch(e){}
+  }
+  function startKeepAlive(){
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = setInterval(() => {
+      v.play?.().catch(()=>{});
+      tg?.expand?.();
+    }, 30000);
+  }
+  function stopKeepAlive(){ clearInterval(keepAliveTimer); keepAliveTimer=null; }
 
-    await ensureCamera();
-
-    const delaySec = rndInt(delayMin, delayMax);
-    const started = Date.now();
-
-    // Прогресс и обратный отсчёт
-    while (!stopRequested){
-      const elapsed = Math.floor((Date.now() - started)/1000);
-      const left = Math.max(0, delaySec - elapsed);
-      pill.textContent = (left > 0) ? `Снимок через ${left} сек` : 'Снимок…';
-      progress(Math.min(100, Math.round(elapsed / delaySec * 100)));
-      if (elapsed >= delaySec) break;
-      await sleep(300);
-    }
-    if (stopRequested) return;
-
-    setStatus('Отправляю…');
-    await captureAndSend('single');
-    progress(100);
-    pill.textContent = 'Готово';
-    setStatus('Фото отправлено');
-    endAndClose(350);
+  // блок закрытия
+  function lockUI(){
+    shield.classList.add('active');
+    document.body.classList.add('noclick');
+    tg?.enableClosingConfirmation?.();
+  }
+  function unlockClicksOnly(){
+    shield.classList.remove('active');
+    document.body.classList.remove('noclick');
+    // confirmation оставляем включенным до явного «Закрыть»
   }
 
-  // Старый режим с несколькими снимками (если shots>1)
+  // кнопка Закрыть
+  function showCloseControls(){
+    try{
+      tg?.MainButton?.setParams?.({text:'Закрыть', is_visible:true});
+      tg?.MainButton?.show?.();
+      tg?.onEvent?.('mainButtonClicked', () => { canClose = true; tg?.close?.(); });
+    }catch(_){}
+    closeBtn.classList.add('show');
+    closeBtn.onclick = () => {
+      canClose = true;
+      window.close();
+      setTimeout(() => alert('Можно закрыть вкладку/вернуться назад.'), 100);
+    };
+  }
+
+  // вычислим моменты трёх снимков:
+  function planShots(totalSec, restSec){
+    const totalMs = totalSec*1000, restMs = restSec*1000;
+    const minFirst = Math.max(restMs, 5000);
+    const latestFirst = Math.max(minFirst, totalMs - 2*restMs - 3000);
+    const firstDelay = Math.floor(minFirst + Math.random() * Math.max(1, (latestFirst - minFirst)));
+    const t1 = firstDelay;
+    const t2 = t1 + restMs;
+    const t3 = t2 + restMs;
+    return [t1, t2, t3];
+  }
+
   async function runWorkout(){
     title.textContent = 'Режим тренировки';
-    pill.textContent  = `${shots} случайных снимка`;
-    setStatus('Камера активна. Оставь окно открытым.');
-    progress(0);
-    stopBtn.classList.remove('hidden');
+    pill.textContent  = `Окно: ${Math.round(totalSec/60)} мин • отдых: ${restSec} сек`;
+    setStatus('Камера активна. Не закрывай это окно.');
+
+    lockUI();
+    await requestWakeLock();
+    startKeepAlive();
+    try { await document.documentElement.requestFullscreen?.(); } catch {}
+    try { await screen.orientation?.lock?.('portrait'); } catch {}
 
     await ensureCamera();
 
-    const schedule = randomSchedule(shots, windowSec);
-    const startedAt = Date.now();
-    let made = 0;
+    const start = Date.now();
+    const [t1, t2, t3] = planShots(totalSec, restSec);
+    const tokens = [];
 
-    const timer = setInterval(()=>{
-      const elapsed = (Date.now()-startedAt)/1000;
-      const p = Math.min(100, Math.round(elapsed/windowSec*100));
-      progress(p);
-    }, 500);
+    // ждём до первого случайного момента
+    await sleep(Math.max(0, t1 - (Date.now() - start)));
+    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 1/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 1: '+(e?.message||e), true); }
 
-    try{
-      for (const tSec of schedule){
-        if (stopRequested) break;
-        const waitMs = Math.max(0, tSec*1000 - (Date.now()-startedAt));
-        await sleep(waitMs);
-        if (stopRequested) break;
+    // снимок 2 через rest
+    await sleep(Math.max(0, t2 - (Date.now() - start)));
+    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 2/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 2: '+(e?.message||e), true); }
 
-        try{
-          await captureAndSend('workout');
-          made += 1;
-          pill.textContent = `Снимок ${made}/${shots}`;
-          setStatus('Отправлено');
-        }catch(e){
-          console.error(e);
-          setStatus(`Ошибка: ${e?.message||e}`, true);
-        }
-      }
-    } finally {
-      clearInterval(timer);
-      progress(100);
-      pill.textContent = 'Готово';
-      setStatus('Сеанс завершён');
-      endAndClose(500);
+    // снимок 3 через rest
+    await sleep(Math.max(0, t3 - (Date.now() - start)));
+    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 3/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 3: '+(e?.message||e), true); }
+
+    // ждём до конца окна
+    const endAt = start + totalSec*1000;
+    const remain = endAt - Date.now();
+    if (remain > 0) {
+      setStatus('Дождись окончания окна тренировки…');
+      await sleep(remain);
     }
+
+    // отправляем результат одним пакетом
+    try{
+      if (inTelegram) {
+        tg.sendData(JSON.stringify({ type:'workout_set', tokens }));
+      } else {
+        console.log('DEV tokens:', tokens);
+      }
+    }catch(e){ console.error(e); }
+
+    pill.textContent = 'Сеанс завершён';
+    setStatus('Готово. Нажми «Закрыть», чтобы выйти.');
+
+    unlockClicksOnly();
+    stopStream(); stopKeepAlive();
+    try { await screen.orientation?.unlock?.(); } catch {}
+
+    showCloseControls();
   }
 
   async function run(){
     try{
-      // Если shots>1 — множественные снимки; иначе — одиночный с задержкой
-      if (mode === 'workout' && shots > 1) await runWorkout();
-      else await runSingle();
+      await runWorkout();
     }catch(e){
       console.error(e);
       setStatus('Ошибка камеры/загрузки: ' + (e?.message||e), true);
-      endAndClose(600);
+      stopStream(); stopKeepAlive();
     }
   }
 
-  window.addEventListener('beforeunload', () => { stopStream(); });
+  window.addEventListener('beforeunload', (e) => {
+    if (!canClose) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  tg?.onEvent?.('viewportChanged', () => tg?.expand?.());
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') v.play?.().catch(()=>{});
+  });
+
   run();
 })();
 </script>
