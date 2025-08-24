@@ -6,8 +6,13 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# В рантайме работаем без пула — проще на Windows/Py3.12.
+# На Windows/py3.12 вам удобнее без пула. Оставляю флаг — при желании можно включить.
 USE_POOL_FOR_RUNTIME = False
+
+
+async def _pool_connection_init(conn: asyncpg.Connection) -> None:
+    """Инициализация каждого коннекта из пула."""
+    await conn.execute("SET search_path TO public")
 
 
 class _DirectConn:
@@ -31,12 +36,13 @@ class _DirectConn:
 class Database:
     """
     Обёртка над БД.
-      - init() — создаёт пул (или одноразовое подключение) и применяет схему/миграции
-      - acquire() — возвращает контекст-менеджер соединения
+      - init() — создаёт пул (или разовое подключение) и применяет схему/миграции
+      - acquire() — вернуть контекст-менеджер соединения
       - truncate_all()/drop_all() — разрушительные операции
       - close() — закрыть пул (если создавали)
+      - drop()/truncate() — совместимые алиасы
     """
-    pool: Optional[asyncpg.Pool] = None  # тип пула из asyncpg
+    pool: Optional[asyncpg.Pool] = None
 
     @classmethod
     async def init(cls) -> None:
@@ -44,9 +50,8 @@ class Database:
         dsn = str(settings.DATABASE_URL)
 
         if USE_POOL_FOR_RUNTIME:
-            if cls.pool is not None:
-                return
-            cls.pool = await asyncpg.create_pool(dsn=dsn)
+            if cls.pool is None:
+                cls.pool = await asyncpg.create_pool(dsn=dsn, init=_pool_connection_init)
             async with cls.pool.acquire() as conn:
                 await conn.execute("SET search_path TO public")
                 await cls._ensure_schema(conn)
@@ -56,7 +61,7 @@ class Database:
                 )
                 logger.info("DB connected: db=%s user=%s schema=%s", row["db"], row["usr"], row["sch"])
         else:
-            # Без пула: просто откроем соединение, применим схему/миграции и закроем.
+            # Без пула: открываем, применяем схему/миграции, закрываем.
             conn = await asyncpg.connect(dsn=dsn)
             try:
                 await conn.execute("SET search_path TO public")
@@ -77,6 +82,7 @@ class Database:
         Возвращает контекст-менеджер соединения:
           - при USE_POOL_FOR_RUNTIME=True — из пула;
           - иначе — одноразовое соединение.
+        Совместимо с: `async with Database.acquire() as conn: ...`
         """
         dsn = str(settings.DATABASE_URL)
         if USE_POOL_FOR_RUNTIME:
@@ -119,10 +125,11 @@ class Database:
             cls.pool = None
             logger.info("Database connection pool closed.")
 
-    # --------- Внутреннее: создание базовой схемы/таблиц ----------
+    # --------- Создание базовой схемы/таблиц ----------
     @classmethod
     async def _ensure_schema(cls, conn: asyncpg.Connection) -> None:
-        """Базовые CREATE TABLE IF NOT EXISTS (безопасно)."""
+        """Базовые CREATE TABLE IF NOT EXISTS (идемпотентно)."""
+        # users
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.users (
                 user_id BIGINT PRIMARY KEY,
@@ -142,10 +149,13 @@ class Database:
                 -- актуальная длительность в минутах (общая)
                 workout_duration INT,
                 -- отдых между подходами в секундах
-                rest_seconds INT
+                rest_seconds INT,
+                -- Часовой пояс пользователя (например, 'Europe/Moscow')
+                timezone TEXT
             )
         """)
 
+        # sets
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.sets (
                 set_id SERIAL PRIMARY KEY,
@@ -157,6 +167,7 @@ class Database:
             )
         """)
 
+        # tasks
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.tasks (
                 task_id SERIAL PRIMARY KEY,
@@ -167,11 +178,20 @@ class Database:
             )
         """)
 
+        # Индексы под частые выборки
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sets_user_created
+            ON public.sets (user_id, created_at DESC)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_users_username
+            ON public.users (username)
+        """)
+
     @classmethod
     async def _run_migrations(cls, conn: asyncpg.Connection) -> None:
-        """
-        Идемпотентные миграции. Можно запускать многократно.
-        """
+        """Идемпотентные миграции (можно вызывать многократно)."""
+
         # users: гарантируем наличие нужных колонок
         await conn.execute("""
             ALTER TABLE public.users
@@ -182,10 +202,11 @@ class Database:
             ADD COLUMN IF NOT EXISTS reminder_days TEXT[],
             ADD COLUMN IF NOT EXISTS reminder_duration TEXT,
             ADD COLUMN IF NOT EXISTS workout_duration INT,
-            ADD COLUMN IF NOT EXISTS rest_seconds INT
+            ADD COLUMN IF NOT EXISTS rest_seconds INT,
+            ADD COLUMN IF NOT EXISTS timezone TEXT
         """)
 
-        # sets: гарантируем наличие нужных колонок
+        # sets: гарантируем наличие таблицы/колонок
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.sets (
                 set_id SERIAL PRIMARY KEY,
@@ -199,6 +220,10 @@ class Database:
         await conn.execute("ALTER TABLE public.sets ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE public.sets ADD COLUMN IF NOT EXISTS gpt_reason TEXT")
         await conn.execute("ALTER TABLE public.sets ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sets_user_created
+            ON public.sets (user_id, created_at DESC)
+        """)
 
         # tasks: гарантируем наличие таблицы
         await conn.execute("""
@@ -211,7 +236,7 @@ class Database:
             )
         """)
 
-    # Совместимые алиасы — как у тебя в handlers.py
+    # --------- Совместимые алиасы, как в handlers.py ----------
     @classmethod
     async def drop(cls):
         await cls.drop_all()

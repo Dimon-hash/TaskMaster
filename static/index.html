@@ -9,7 +9,7 @@
     html,body{height:100%}
     body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0f14;color:#fff;user-select:none;touch-action:none}
     .wrap{padding:16px;display:flex;flex-direction:column;gap:14px;align-items:center;max-width:520px;margin:0 auto}
-    video#v{width:100%;max-width:480px;border-radius:16px;background:#000}
+    video.view{width:100%;max-width:480px;border-radius:16px;background:#000}
     canvas#c{display:none}
     .title{font-size:16px;opacity:.95;text-align:center}
     .pill{font-variant-numeric:tabular-nums;font-weight:700;background:#0f1620;border:1px solid #1d2732;border-radius:999px;padding:8px 12px}
@@ -24,14 +24,20 @@
     .noclick{pointer-events:none}
     #closeBtn{display:none;margin-top:8px}
     #closeBtn.show{display:inline-block}
+
+    /* NEW: «парковка» якорного видео — НЕ display:none */
+    #camHost{position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1}
   </style>
 </head>
 <body>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 
+<!-- NEW: якорь, который живёт весь сеанс -->
+<div id="camHost"><video id="cam" playsinline muted></video></div>
+
 <div class="wrap">
   <div class="title">Камера готовится…</div>
-  <video id="v" playsinline autoplay muted></video>
+  <video id="v" class="view" playsinline autoplay muted></video>
   <canvas id="c"></canvas>
 
   <div class="pill">Снимки выполняются: 1 — случайно, 2 и 3 — через отдых</div>
@@ -47,7 +53,40 @@
   const tg = window.Telegram?.WebApp;
   tg?.expand?.(); tg?.ready?.();
 
-  let stream = null, wakeLock = null, keepAliveTimer = null;
+  // ====== СИНГЛТОН КАМЕРЫ (живёт в window между вашими экранами) ======
+  const camEl = document.getElementById('cam');
+  async function getSharedStream() {
+    if (window.__sharedStream && window.__sharedStream.getVideoTracks().some(t => t.readyState === 'live')) {
+      return window.__sharedStream;
+    }
+    let s;
+    try {
+      s = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'user' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+    } catch {
+      s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    }
+    window.__sharedStream = s;
+    camEl.srcObject = s;
+    try { await camEl.play(); } catch {}
+    return s;
+  }
+  async function attachVisibleVideo(viewEl) {
+    const s = await getSharedStream();
+    if (viewEl.srcObject !== s) viewEl.srcObject = s;
+    // iOS может потребовать жест, но пробуем
+    try { await viewEl.play(); } catch {}
+  }
+  function stopSharedStream() {
+    const s = window.__sharedStream;
+    if (s) { try { s.getTracks().forEach(t => t.stop()); } catch {} }
+    window.__sharedStream = null;
+  }
+
+  // ====== Остальной код ======
+  let wakeLock = null, keepAliveTimer = null;
   let canClose = false;
 
   const v = document.getElementById('v');
@@ -64,12 +103,10 @@
   const inTelegram = !!(tg && (tg.platform || tg.initDataUnsafe?.user || (tg.initData && tg.initData.length)));
   const dev = qs.get('dev') === '1' || !inTelegram;
 
-  // ---------- утилиты ----------
   function setStatus(text, isErr=false){
     status.textContent = text;
     status.className = 'status' + (isErr ? ' err' : ' muted');
   }
-  function stopStream(){ try{ stream?.getTracks?.().forEach(t=>t.stop()); }catch(_){} stream=null; }
   const sleep = ms => new Promise(r=>setTimeout(r, ms));
 
   function canvasToBlob(canvas, type='image/jpeg', q=0.9){
@@ -84,11 +121,12 @@
   }
 
   async function captureAndUploadToken(){
-    const vw=v.videoWidth||720, vh=v.videoHeight||1280;
-    const w=Math.min(1280,vw), h=Math.round(w*(vh/vw));
-    c.width=w; c.height=h;
-    const ctx = c.getContext('2d', {willReadFrequently:true});
-    ctx.drawImage(v,0,0,w,h);
+    // всегда берём кадр с ЯКОРНОГО camEl (он не размонтируется)
+    const vw = camEl.videoWidth || 720, vh = camEl.videoHeight || 1280;
+    const w = Math.min(1280, vw), h = Math.round(w * (vh / vw));
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d', { willReadFrequently:true });
+    ctx.drawImage(camEl, 0, 0, w, h);
 
     const blob = await canvasToBlob(c,'image/jpeg',0.9);
     const form = new FormData();
@@ -106,20 +144,6 @@
     return String(data.token);
   }
 
-  async function ensureCamera(){
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:'user' } }, audio:false });
-    } catch {
-      stream = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
-    }
-    v.srcObject = stream;
-    await new Promise(res=>{
-      if (v.readyState >= 1) return res();
-      v.addEventListener('loadedmetadata', res, {once:true});
-    });
-    try { await v.play(); } catch {}
-  }
-
   // Wake Lock + keep-alive
   async function requestWakeLock(){
     try{
@@ -128,6 +152,8 @@
         document.addEventListener('visibilitychange', async () => {
           if (document.visibilityState === 'visible') {
             try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+            // iOS: после возврата перепривязать поток и попытаться play()
+            attachVisibleVideo(v);
           }
         });
       }
@@ -137,12 +163,12 @@
     clearInterval(keepAliveTimer);
     keepAliveTimer = setInterval(() => {
       v.play?.().catch(()=>{});
+      camEl.play?.().catch(()=>{});
       tg?.expand?.();
     }, 30000);
   }
   function stopKeepAlive(){ clearInterval(keepAliveTimer); keepAliveTimer=null; }
 
-  // блок закрытия
   function lockUI(){
     shield.classList.add('active');
     document.body.classList.add('noclick');
@@ -151,10 +177,7 @@
   function unlockClicksOnly(){
     shield.classList.remove('active');
     document.body.classList.remove('noclick');
-    // confirmation оставляем включенным до явного «Закрыть»
   }
-
-  // кнопка Закрыть
   function showCloseControls(){
     try{
       tg?.MainButton?.setParams?.({text:'Закрыть', is_visible:true});
@@ -169,7 +192,6 @@
     };
   }
 
-  // вычислим моменты трёх снимков:
   function planShots(totalSec, restSec){
     const totalMs = totalSec*1000, restMs = restSec*1000;
     const minFirst = Math.max(restMs, 5000);
@@ -192,21 +214,22 @@
     try { await document.documentElement.requestFullscreen?.(); } catch {}
     try { await screen.orientation?.lock?.('portrait'); } catch {}
 
-    await ensureCamera();
+    // ВАЖНО: не создаём новый поток — просто привязываем видимый player к общему
+    await attachVisibleVideo(v);
 
     const start = Date.now();
     const [t1, t2, t3] = planShots(totalSec, restSec);
     const tokens = [];
 
-    // ждём до первого случайного момента
+    // снимок 1
     await sleep(Math.max(0, t1 - (Date.now() - start)));
     try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 1/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 1: '+(e?.message||e), true); }
 
-    // снимок 2 через rest
+    // снимок 2
     await sleep(Math.max(0, t2 - (Date.now() - start)));
     try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 2/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 2: '+(e?.message||e), true); }
 
-    // снимок 3 через rest
+    // снимок 3
     await sleep(Math.max(0, t3 - (Date.now() - start)));
     try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 3/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 3: '+(e?.message||e), true); }
 
@@ -218,7 +241,6 @@
       await sleep(remain);
     }
 
-    // отправляем результат одним пакетом
     try{
       if (inTelegram) {
         tg.sendData(JSON.stringify({ type:'workout_set', tokens }));
@@ -231,7 +253,8 @@
     setStatus('Готово. Нажми «Закрыть», чтобы выйти.');
 
     unlockClicksOnly();
-    stopStream(); stopKeepAlive();
+    stopSharedStream();  // стопаем ТОЛЬКО в конце
+    stopKeepAlive();
     try { await screen.orientation?.unlock?.(); } catch {}
 
     showCloseControls();
@@ -243,18 +266,16 @@
     }catch(e){
       console.error(e);
       setStatus('Ошибка камеры/загрузки: ' + (e?.message||e), true);
-      stopStream(); stopKeepAlive();
+      stopSharedStream(); stopKeepAlive();
     }
   }
 
-  window.addEventListener('beforeunload', (e) => {
-    if (!canClose) { e.preventDefault(); e.returnValue = ''; }
-  });
+  // блокируем случайное закрытие
+  window.addEventListener('beforeunload', (e) => { if (!canClose) { e.preventDefault(); e.returnValue = ''; } });
 
+  // При возвращении во вью — перепривязать поток и попытаться resume
   tg?.onEvent?.('viewportChanged', () => tg?.expand?.());
-  window.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') v.play?.().catch(()=>{});
-  });
+  window.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') attachVisibleVideo(v); });
 
   run();
 })();
