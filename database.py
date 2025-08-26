@@ -1,23 +1,44 @@
+# database.py
 import logging
+import os
 from typing import Optional
 
 import asyncpg
-from config import settings
 
 logger = logging.getLogger(__name__)
 
-# На Windows/py3.12 вам удобнее без пула. Оставляю флаг — при желании можно включить.
+# На Windows/py3.12 удобнее без пула. В проде можно включить.
 USE_POOL_FOR_RUNTIME = False
 
 
 async def _pool_connection_init(conn: asyncpg.Connection) -> None:
-    """Инициализация каждого коннекта из пула."""
     await conn.execute("SET search_path TO public")
+
+
+def _dsn_from_env() -> str:
+    """
+    Берём DSN из ENV и добавляем sslmode=require, если это удалённая БД.
+    Для Render Postgres это обязательно.
+    """
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    lower = dsn.lower()
+    # если уже указан ssl, оставляем как есть
+    if "sslmode=" in lower:
+        return dsn
+
+    # локалке SSL не навязываем
+    if any(h in lower for h in ("localhost", "127.0.0.1")):
+        return dsn
+
+    sep = "&" if "?" in dsn else "?"
+    return f"{dsn}{sep}sslmode=require"
 
 
 class _DirectConn:
     """Контекст-менеджер одноразового соединения (без пула)."""
-
     def __init__(self, dsn: str):
         self._dsn = dsn
         self._conn: Optional[asyncpg.Connection] = None
@@ -34,20 +55,11 @@ class _DirectConn:
 
 
 class Database:
-    """
-    Обёртка над БД.
-      - init() — создаёт пул (или разовое подключение) и применяет схему/миграции
-      - acquire() — вернуть контекст-менеджер соединения
-      - truncate_all()/drop_all() — разрушительные операции
-      - close() — закрыть пул (если создавали)
-      - drop()/truncate() — совместимые алиасы
-    """
     pool: Optional[asyncpg.Pool] = None
 
     @classmethod
     async def init(cls) -> None:
-        """Инициализация БД и применение миграций."""
-        dsn = str(settings.DATABASE_URL)
+        dsn = _dsn_from_env()
 
         if USE_POOL_FOR_RUNTIME:
             if cls.pool is None:
@@ -61,7 +73,6 @@ class Database:
                 )
                 logger.info("DB connected: db=%s user=%s schema=%s", row["db"], row["usr"], row["sch"])
         else:
-            # Без пула: открываем, применяем схему/миграции, закрываем.
             conn = await asyncpg.connect(dsn=dsn)
             try:
                 await conn.execute("SET search_path TO public")
@@ -78,13 +89,7 @@ class Database:
 
     @classmethod
     def acquire(cls):
-        """
-        Возвращает контекст-менеджер соединения:
-          - при USE_POOL_FOR_RUNTIME=True — из пула;
-          - иначе — одноразовое соединение.
-        Совместимо с: `async with Database.acquire() as conn: ...`
-        """
-        dsn = str(settings.DATABASE_URL)
+        dsn = _dsn_from_env()
         if USE_POOL_FOR_RUNTIME:
             if cls.pool is None:
                 raise RuntimeError("Pool is not initialized. Call Database.init() first.")
@@ -93,8 +98,7 @@ class Database:
 
     @classmethod
     async def truncate_all(cls) -> None:
-        """TRUNCATE всех таблиц с RESTART IDENTITY."""
-        conn = await asyncpg.connect(dsn=str(settings.DATABASE_URL))
+        conn = await asyncpg.connect(dsn=_dsn_from_env())
         try:
             await conn.execute("SET search_path TO public")
             await conn.execute("TRUNCATE TABLE public.sets RESTART IDENTITY CASCADE")
@@ -106,8 +110,7 @@ class Database:
 
     @classmethod
     async def drop_all(cls) -> None:
-        """DROP всех таблиц (безопасно с IF EXISTS)."""
-        conn = await asyncpg.connect(dsn=str(settings.DATABASE_URL))
+        conn = await asyncpg.connect(dsn=_dsn_from_env())
         try:
             await conn.execute("SET search_path TO public")
             await conn.execute("DROP TABLE IF EXISTS public.sets CASCADE")
@@ -119,17 +122,14 @@ class Database:
 
     @classmethod
     async def close(cls) -> None:
-        """Закрыть пул, если он был создан."""
         if cls.pool is not None:
             await cls.pool.close()
             cls.pool = None
             logger.info("Database connection pool closed.")
 
-    # --------- Создание базовой схемы/таблиц ----------
+    # --------- схема / миграции (как у тебя) ---------
     @classmethod
     async def _ensure_schema(cls, conn: asyncpg.Connection) -> None:
-        """Базовые CREATE TABLE IF NOT EXISTS (идемпотентно)."""
-        # users
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.users (
                 user_id BIGINT PRIMARY KEY,
@@ -144,18 +144,12 @@ class Database:
                 reminder_enabled BOOLEAN DEFAULT FALSE,
                 reminder_time TIME,
                 reminder_days TEXT[],
-                -- legacy
                 reminder_duration TEXT,
-                -- актуальная длительность в минутах (общая)
                 workout_duration INT,
-                -- отдых между подходами в секундах
                 rest_seconds INT,
-                -- Часовой пояс пользователя (например, 'Europe/Moscow')
                 timezone TEXT
             )
         """)
-
-        # sets
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.sets (
                 set_id SERIAL PRIMARY KEY,
@@ -166,8 +160,6 @@ class Database:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # tasks
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.tasks (
                 task_id SERIAL PRIMARY KEY,
@@ -177,8 +169,6 @@ class Database:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # Индексы под частые выборки
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_sets_user_created
             ON public.sets (user_id, created_at DESC)
@@ -190,9 +180,6 @@ class Database:
 
     @classmethod
     async def _run_migrations(cls, conn: asyncpg.Connection) -> None:
-        """Идемпотентные миграции (можно вызывать многократно)."""
-
-        # users: гарантируем наличие нужных колонок
         await conn.execute("""
             ALTER TABLE public.users
             ADD COLUMN IF NOT EXISTS training_program TEXT,
@@ -205,8 +192,6 @@ class Database:
             ADD COLUMN IF NOT EXISTS rest_seconds INT,
             ADD COLUMN IF NOT EXISTS timezone TEXT
         """)
-
-        # sets: гарантируем наличие таблицы/колонок
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.sets (
                 set_id SERIAL PRIMARY KEY,
@@ -224,8 +209,6 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_sets_user_created
             ON public.sets (user_id, created_at DESC)
         """)
-
-        # tasks: гарантируем наличие таблицы
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS public.tasks (
                 task_id SERIAL PRIMARY KEY,
@@ -236,7 +219,6 @@ class Database:
             )
         """)
 
-    # --------- Совместимые алиасы, как в handlers.py ----------
     @classmethod
     async def drop(cls):
         await cls.drop_all()
