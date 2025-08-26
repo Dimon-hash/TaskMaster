@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+python-telegram-bot[job-queue]
 python-telegram-bot==21.*
 python-dotenv
 starlette
