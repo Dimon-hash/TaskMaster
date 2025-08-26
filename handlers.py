@@ -1262,17 +1262,14 @@ async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выбирай дни кнопками ниже и жми «Готово ▶️».",
             reply_markup=_days_toggle_kb(st)
         )
-from urllib.parse import urlencode
 
 def _webapp_base() -> str:
-    # 1) сначала WEBAPP_URL, если задан; иначе PUBLIC_BASE_URL
     base = (getattr(settings, "WEBAPP_URL", None) or getattr(settings, "PUBLIC_BASE_URL", "")).strip()
     base = base.rstrip("/")
-    # 2) принудительно https
     if base.startswith("http://"):
         base = "https://" + base[len("http://"):]
     if not base.startswith("https://"):
-        base = "https://" + base  # на случай если передали без схемы
+        base = "https://" + base
     return base
 
 def _build_webapp_url(params: dict) -> str:
