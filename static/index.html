@@ -1,14 +1,26 @@
 <!doctype html>
-<html>
+<html lang="ru">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Тренировка — камера</title>
   <style>
     :root{color-scheme:dark}
-    html,body{height:100%}
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0f14;color:#fff;user-select:none;touch-action:none}
-    .wrap{padding:16px;display:flex;flex-direction:column;gap:14px;align-items:center;max-width:520px;margin:0 auto}
+    html,body{min-height:100%}
+    body{
+      margin:0;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      background:#0b0f14;color:#fff;
+      user-select:none;              /* оставляем запрет выделения */
+      /* touch-action:none; */       /* УБРАНО — скролл снова работает */
+      -webkit-overflow-scrolling:touch; /* плавный скролл на iOS */
+    }
+    .wrap{
+      padding:16px;
+      display:flex;flex-direction:column;gap:14px;
+      align-items:center;
+      max-width:520px;margin:0 auto;
+    }
     video.view{width:100%;max-width:480px;border-radius:16px;background:#000}
     canvas#c{display:none}
     .title{font-size:16px;opacity:.95;text-align:center}
@@ -18,25 +30,39 @@
     .muted{opacity:.8}
     .btn{appearance:none;border:1px solid #1d2732;background:#0f1620;color:#fff;border-radius:10px;padding:10px 14px;font-size:14px}
     .btn:active{transform:scale(0.99)}
-    #shield{position:fixed;inset:0;background:rgba(11,15,20,.6);backdrop-filter:saturate(120%) blur(2px);display:none;align-items:center;justify-content:center;z-index:9999;pointer-events:auto;cursor:wait}
-    #shield.active{display:flex}
-    #shield .msg{font-size:15px;opacity:.95;padding:12px 14px;background:#0f1620;border:1px solid #1d2732;border-radius:12px}
-    .noclick{pointer-events:none}
     #closeBtn{display:none;margin-top:8px}
     #closeBtn.show{display:inline-block}
 
-    /* NEW: «парковка» якорного видео — НЕ display:none */
+    /* якорная невидимая камера (поток живёт весь сеанс) */
     #camHost{position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1}
+
+    /* панель плана */
+    #planCard{border:1px solid #1d2732;background:#0f1620;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:10px}
+    #planCard h3{margin:0;font-size:15px;opacity:.95}
+    #planText{white-space:pre-wrap;line-height:1.35;opacity:.95}
+    #planMedia{width:100%;aspect-ratio:16/9;border-radius:10px;overflow:hidden}
+    #plan a{color:#9ecbff;text-decoration:none}
+    #plan a:hover{text-decoration:underline}
   </style>
 </head>
 <body>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 
-<!-- NEW: якорь, который живёт весь сеанс -->
+<!-- общий video с потоком, чтобы он не отваливался -->
 <div id="camHost"><video id="cam" playsinline muted></video></div>
 
 <div class="wrap">
   <div class="title">Камера готовится…</div>
+
+  <!-- План тренировки (если переданы plan_text/plan_video) -->
+  <div id="plan" style="width:100%;max-width:480px;display:none;">
+    <div id="planCard">
+      <h3>План тренировки</h3>
+      <div id="planText"></div>
+      <div id="planMedia"></div>
+    </div>
+  </div>
+
   <video id="v" class="view" playsinline autoplay muted></video>
   <canvas id="c"></canvas>
 
@@ -46,18 +72,19 @@
   <button id="closeBtn" class="btn">Закрыть</button>
 </div>
 
-<div id="shield"><div class="msg">Тренировка идёт… не закрывай окно</div></div>
-
 <script>
 (() => {
   const tg = window.Telegram?.WebApp;
   tg?.expand?.(); tg?.ready?.();
 
-  // ====== СИНГЛТОН КАМЕРЫ (живёт в window между вашими экранами) ======
+  // ====== СИНГЛТОН КАМЕРЫ ======
   const camEl = document.getElementById('cam');
   async function getSharedStream() {
     if (window.__sharedStream && window.__sharedStream.getVideoTracks().some(t => t.readyState === 'live')) {
       return window.__sharedStream;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Камера недоступна в этом браузере.');
     }
     let s;
     try {
@@ -76,7 +103,6 @@
   async function attachVisibleVideo(viewEl) {
     const s = await getSharedStream();
     if (viewEl.srcObject !== s) viewEl.srcObject = s;
-    // iOS может потребовать жест, но пробуем
     try { await viewEl.play(); } catch {}
   }
   function stopSharedStream() {
@@ -94,12 +120,11 @@
   const title = document.querySelector('.title');
   const pill  = document.querySelector('.pill');
   const status= document.querySelector('.status');
-  const shield= document.getElementById('shield');
   const closeBtn = document.getElementById('closeBtn');
 
   const qs = new URLSearchParams(location.search);
-  const totalSec  = Math.max(60, parseInt(qs.get('window') || '3600', 10));  // вся длительность тренировки
-  const restSec   = Math.max(1,  parseInt(qs.get('rest')   || '60',   10));  // отдых между 2-м и 3-м кадром
+  const totalSec  = Math.max(60, parseInt(qs.get('window') || '3600', 10));  // длительность окна
+  const restSec   = Math.max(1,  parseInt(qs.get('rest')   || '60',   10));  // отдых между 2 и 3
   const inTelegram = !!(tg && (tg.platform || tg.initDataUnsafe?.user || (tg.initData && tg.initData.length)));
   const dev = qs.get('dev') === '1' || !inTelegram;
 
@@ -121,7 +146,6 @@
   }
 
   async function captureAndUploadToken(){
-    // всегда берём кадр с ЯКОРНОГО camEl (он не размонтируется)
     const vw = camEl.videoWidth || 720, vh = camEl.videoHeight || 1280;
     const w = Math.min(1280, vw), h = Math.round(w * (vh / vw));
     c.width = w; c.height = h;
@@ -152,7 +176,6 @@
         document.addEventListener('visibilitychange', async () => {
           if (document.visibilityState === 'visible') {
             try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
-            // iOS: после возврата перепривязать поток и попытаться play()
             attachVisibleVideo(v);
           }
         });
@@ -169,15 +192,6 @@
   }
   function stopKeepAlive(){ clearInterval(keepAliveTimer); keepAliveTimer=null; }
 
-  function lockUI(){
-    shield.classList.add('active');
-    document.body.classList.add('noclick');
-    tg?.enableClosingConfirmation?.();
-  }
-  function unlockClicksOnly(){
-    shield.classList.remove('active');
-    document.body.classList.remove('noclick');
-  }
   function showCloseControls(){
     try{
       tg?.MainButton?.setParams?.({text:'Закрыть', is_visible:true});
@@ -203,37 +217,116 @@
     return [t1, t2, t3];
   }
 
+  // ====== Рендер плана из параметров URL ======
+  const decodePlus = s => (s || '').replace(/\+/g, ' ');
+  const planTextParam  = decodePlus(qs.get('plan_text')  || '').trim();
+  const planVideoParam = decodePlus(qs.get('plan_video') || '').trim();
+
+  function renderPlan(){
+    const planRoot = document.getElementById('plan');
+    const planText = document.getElementById('planText');
+    const planMedia= document.getElementById('planMedia');
+    if (!planRoot) return;
+
+    if (planMedia) planMedia.innerHTML = '';
+    if (planText)  planText.textContent = '';
+
+    let hasAnything = false;
+
+    if (planTextParam && planText) {
+      planText.textContent = planTextParam;
+      planText.style.display = 'block';
+      hasAnything = true;
+    } else if (planText) {
+      planText.style.display = 'none';
+    }
+
+    if (planVideoParam && planMedia) {
+      const url = planVideoParam;
+      const yt = url.match(/^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/.*?[?&]v=|youtu\.be\/)([\w\-]{6,})/i);
+      const vk = url.match(/^(?:https?:\/\/)?(?:www\.)?vk\.com\/video/i);
+
+      if (yt) {
+        const vid = yt[1];
+        const iframe = document.createElement('iframe');
+        iframe.src = `https://www.youtube.com/embed/${vid}`;
+        iframe.setAttribute('allowfullscreen', '');
+        iframe.setAttribute('frameborder', '0');
+        iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+        iframe.allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share";
+        iframe.style.width = "100%";
+        iframe.style.height = "100%";
+        planMedia.appendChild(iframe);
+        hasAnything = true;
+      } else if (vk) {
+        const a = document.createElement('a');
+        a.href = url; a.textContent = "Открыть видео VK";
+        a.target = "_blank"; a.rel = "noopener";
+        a.style.display = "inline-block";
+        planMedia.style.aspectRatio = "auto";
+        planMedia.appendChild(a);
+        hasAnything = true;
+      } else {
+        const ext = url.split('?')[0].split('#')[0].split('.').pop().toLowerCase();
+        if (['mp4','webm','ogg','mov','m4v'].includes(ext)) {
+          const video = document.createElement('video');
+          video.src = url;
+          video.controls = true;
+          video.playsInline = true;
+          video.style.width = "100%";
+          video.style.height = "100%";
+          planMedia.appendChild(video);
+          hasAnything = true;
+        } else {
+          const a = document.createElement('a');
+          a.href = url; a.textContent = "Открыть видео";
+          a.target = "_blank"; a.rel = "noopener";
+          a.style.display = "inline-block";
+          planMedia.style.aspectRatio = "auto";
+          planMedia.appendChild(a);
+          hasAnything = true;
+        }
+      }
+      planMedia.style.display = 'block';
+    } else if (planMedia) {
+      planMedia.style.display = 'none';
+    }
+
+    planRoot.style.display = hasAnything ? 'block' : 'none';
+  }
+
   async function runWorkout(){
     title.textContent = 'Режим тренировки';
     pill.textContent  = `Окно: ${Math.round(totalSec/60)} мин • отдых: ${restSec} сек`;
     setStatus('Камера активна. Не закрывай это окно.');
 
-    lockUI();
+    renderPlan();
+
     await requestWakeLock();
     startKeepAlive();
-    try { await document.documentElement.requestFullscreen?.(); } catch {}
-    try { await screen.orientation?.lock?.('portrait'); } catch {}
 
-    // ВАЖНО: не создаём новый поток — просто привязываем видимый player к общему
+    // ⚠️ НЕ уходим в fullscreen — иначе на телефоне не будет скролла
+    // try { await document.documentElement.requestFullscreen?.(); } catch {}
+    // try { await screen.orientation?.lock?.('portrait'); } catch {}
+
     await attachVisibleVideo(v);
 
     const start = Date.now();
     const [t1, t2, t3] = planShots(totalSec, restSec);
     const tokens = [];
 
-    // снимок 1
     await sleep(Math.max(0, t1 - (Date.now() - start)));
-    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 1/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 1: '+(e?.message||e), true); }
+    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 1/3 выполнен…'); }
+    catch(e){ setStatus('Ошибка на снимке 1: '+(e?.message||e), true); }
 
-    // снимок 2
     await sleep(Math.max(0, t2 - (Date.now() - start)));
-    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 2/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 2: '+(e?.message||e), true); }
+    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 2/3 выполнен…'); }
+    catch(e){ setStatus('Ошибка на снимке 2: '+(e?.message||e), true); }
 
-    // снимок 3
     await sleep(Math.max(0, t3 - (Date.now() - start)));
-    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 3/3 выполнен…'); } catch(e){ setStatus('Ошибка на снимке 3: '+(e?.message||e), true); }
+    try { tokens.push(await captureAndUploadToken()); setStatus('Снимок 3/3 выполнен…'); }
+    catch(e){ setStatus('Ошибка на снимке 3: '+(e?.message||e), true); }
 
-    // ждём до конца окна
     const endAt = start + totalSec*1000;
     const remain = endAt - Date.now();
     if (remain > 0) {
@@ -252,10 +345,9 @@
     pill.textContent = 'Сеанс завершён';
     setStatus('Готово. Нажми «Закрыть», чтобы выйти.');
 
-    unlockClicksOnly();
-    stopSharedStream();  // стопаем ТОЛЬКО в конце
+    stopSharedStream();
     stopKeepAlive();
-    try { await screen.orientation?.unlock?.(); } catch {}
+    // try { await screen.orientation?.unlock?.(); } catch {}
 
     showCloseControls();
   }
@@ -270,12 +362,14 @@
     }
   }
 
-  // блокируем случайное закрытие
-  window.addEventListener('beforeunload', (e) => { if (!canClose) { e.preventDefault(); e.returnValue = ''; } });
-
-  // При возвращении во вью — перепривязать поток и попытаться resume
+  // защита от случайного закрытия
+  window.addEventListener('beforeunload', (e) => {
+    if (!canClose) { e.preventDefault(); e.returnValue = ''; }
+  });
   tg?.onEvent?.('viewportChanged', () => tg?.expand?.());
-  window.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') attachVisibleVideo(v); });
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') attachVisibleVideo(v);
+  });
 
   run();
 })();
