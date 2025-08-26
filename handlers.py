@@ -158,7 +158,7 @@ async def _build_workout_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: i
     if plan_video:
         params["plan_video"] = plan_video[:500]
 
-    url = str(settings.WEBAPP_URL) + "?" + urlencode(params, doseq=False, safe=":/?&=,+@")
+    url = _build_webapp_url(params)
     rows = [[KeyboardButton("▶️ Начать тренировку", web_app=WebAppInfo(url=url))]]
 
     rows.append([KeyboardButton("📊 Профиль")] if _is_registered(user_id) else [KeyboardButton("📝 Регистрация")])
@@ -180,14 +180,16 @@ def _make_keyboard(is_workout: bool, user_id: int) -> ReplyKeyboardMarkup:
             KeyboardButton(
                 "▶️ Начать тренировку",
                 web_app=WebAppInfo(
-                    url=str(settings.WEBAPP_URL)
-                    + "?mode=workout"
-                    + "&shots=3"
-                    + f"&rest={rest_sec}"
-                    + f"&window={window_sec}"
-                    + "&verify=home"
+                    url=_build_webapp_url({
+                        "mode": "workout",
+                        "shots": "3",
+                        "rest": str(rest_sec),
+                        "window": str(window_sec),
+                        "verify": "home",
+                    })
                 )
             )
+
         ])
     if _is_registered(user_id):
         rows.append([KeyboardButton("📊 Профиль")])
@@ -1221,6 +1223,21 @@ async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выбирай дни кнопками ниже и жми «Готово ▶️».",
             reply_markup=_days_toggle_kb(st)
         )
+from urllib.parse import urlencode
+
+def _webapp_base() -> str:
+    # 1) сначала WEBAPP_URL, если задан; иначе PUBLIC_BASE_URL
+    base = (getattr(settings, "WEBAPP_URL", None) or getattr(settings, "PUBLIC_BASE_URL", "")).strip()
+    base = base.rstrip("/")
+    # 2) принудительно https
+    if base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+    if not base.startswith("https://"):
+        base = "https://" + base  # на случай если передали без схемы
+    return base
+
+def _build_webapp_url(params: dict) -> str:
+    return _webapp_base() + "/?" + urlencode(params, safe=":/?&=,+@")
 
 # ---------------- Сохранение настроек онбординга ----------------
 async def _persist_onboarding_schedule_per_day(user_id: int, context: ContextTypes.DEFAULT_TYPE, st: dict) -> Optional[str]:
