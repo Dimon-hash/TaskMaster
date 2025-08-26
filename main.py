@@ -12,37 +12,39 @@ from telegram.ext import (
     Defaults,
 )
 
-from config import settings
-    # your config module
-from database import Database
-    # your DB module
-import handlers
-    # your handlers module
+from config import settings        # ваш модуль конфигурации
+from database import Database      # ваш модуль БД
+import handlers                    # ваш модуль с хендлерами
 
 
 def main():
     # 1) Логи
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
     logger = logging.getLogger(__name__)
     logger.info("Бот запускается...")
 
-    # 2) Windows / Python 3.12: корректная политика + свой event loop
+    # 2) Windows / Python 3.12: корректная политика цикла событий
     if sys.platform.startswith("win"):
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except Exception:
             pass
 
+    # 3) Создаём и устанавливаем event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # 3) Инициализация БД в текущем loop’е
+    # 4) Инициализация БД в текущем loop’е
     loop.run_until_complete(Database.init())
 
-    # 4) Таймзона
-    TZ = ZoneInfo(getattr(settings, "TIMEZONE", "Europe/Moscow"))
+    # 5) Таймзона по умолчанию
+    tz_name = getattr(settings, "TIMEZONE", "Europe/Moscow")
+    TZ = ZoneInfo(tz_name)
 
-    # 5) Приложение
+    # 6) Приложение PTB
     app = (
         Application.builder()
         .token(settings.TELEGRAM_TOKEN)
@@ -50,15 +52,16 @@ def main():
         .build()
     )
 
-    # 6) Хендлеры
+    # 7) Хендлеры
 
-    # Данные из WebApp (если есть)
+    # Данные из WebApp (если используются)
     if hasattr(handlers, "handle_webapp_data"):
         app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handlers.handle_webapp_data))
 
     # Команды
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("profile", handlers.profile))
+
     if hasattr(handlers, "clear_db"):
         app.add_handler(CommandHandler("clear_db", handlers.clear_db))
     if hasattr(handlers, "delete_db"):
@@ -70,7 +73,7 @@ def main():
     if hasattr(handlers, "end_workout"):
         app.add_handler(CommandHandler("end_workout", handlers.end_workout))
 
-    # Фото (и документ image/*) во время регистрации
+    # Фото (и документ image/*)
     app.add_handler(
         MessageHandler(
             (filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
@@ -80,34 +83,40 @@ def main():
 
     # >>> Порядок callback’ов ВАЖЕН! <<<
     # 1) Депозитные кнопки (после выполнения окна / при списании)
+    #    depwin_repeat, depwin_change_amount, depwin_change_sched, depwin_later, depforf_restart
     app.add_handler(
         CallbackQueryHandler(
             handlers.deposit_callback,
-            pattern=r"^(depwin_|depforf_)",  # depwin_repeat, depwin_change_amount, depforf_restart и т.п.
+            pattern=r"^(depwin_|depforf_)",
             block=True,
         )
     )
 
-    # 2) Регистрационные инлайны (тумблеры дней/времени/отдыха/длительности + dep_ok/dep_custom)
+    # 2) Регистрационные инлайны:
+    #    - экран 1 → экран 2: ob_next            ← ДОБАВЛЕНО
+    #    - старт 3 вопросов: qa_begin
+    #    - тумблеры дней/времени/отдыха/длительности: days_*, time_*, rest*, dur_*
+    #    - выбор депозита: dep_ok / dep_custom
     app.add_handler(
         CallbackQueryHandler(
             handlers.register_callback,
-            pattern=r"^(days_|time_|rest|dur_|dep_(ok|custom)$)",
+            pattern=r"^(ob_next$|qa_begin$|days_|time_|rest|dur_|dep_(ok|custom)$)",
             block=True,
         )
     )
 
-    # 3) Прочие callback’и меню — как фолбэк
+    # 3) Прочие callback’и меню — как фолбэк (если есть)
     if hasattr(handlers, "menu_callback"):
         app.add_handler(CallbackQueryHandler(handlers.menu_callback, block=False))
 
-    # Кнопка "Профиль"
-    app.add_handler(MessageHandler(filters.Regex("^📊 Профиль$"), handlers.profile))
+    # Кнопка "Профиль" из ReplyKeyboard
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Профиль$"), handlers.profile))
 
-    # Текстовый роутер (последним)
+    # Текстовый роутер (идёт последним)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
 
-    # 7) Запуск polling
+    # 8) Запуск polling
+    logger.info("Стартуем polling...")
     app.run_polling(allowed_updates=None)
 
 
