@@ -1,4 +1,8 @@
-python-telegram-bot>=20.0a0
+fastapi
+uvicorn[standard]
+python-telegram-bot==21.*
+python-dotenv
+starlette
 asyncpg
 opencv-python-headless
 numpy
