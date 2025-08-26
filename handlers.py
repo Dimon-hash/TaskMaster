@@ -126,7 +126,46 @@ async def _safe_cq_answer(cq, text: Optional[str] = None, **kwargs) -> None:
         raise
 
 # ---------------- Клавиатуры (главное меню) ----------------
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse  # (объединил импорт)
+
+def _is_private_host(netloc: str) -> bool:
+    host = netloc.split(":")[0].lower()
+    return (
+        host in {"localhost", "127.0.0.1"} or
+        host.startswith("192.168.") or
+        host.startswith("10.") or
+        host.startswith("172.16.") or host.startswith("172.17.") or
+        host.startswith("172.18.") or host.startswith("172.19.") or
+        host.startswith("172.2")  # 172.20–172.31
+    )
+
+def _webapp_base() -> str:
+    """
+    Источник правды — settings.WEBAPP_ORIGIN (нормализуется в config.py).
+    Локально — http://127.0.0.1:8000
+    Ничего не форсим здесь, чтобы не ловить SSL-ошибки.
+    """
+    # если есть WEBAPP_ORIGIN — используем её (она уже без завершающего /)
+    origin = getattr(settings, "WEBAPP_ORIGIN", None)
+    if origin:
+        return str(origin).rstrip("/")
+
+    # иначе fallback на свойство WEBAPP_URL (в нём есть завершающий /)
+    base = str(getattr(settings, "WEBAPP_URL", "http://127.0.0.1:8000/")).strip().rstrip("/")
+    # если вдруг пришло без схемы — добавим http
+    if not base.startswith(("http://", "https://")):
+        base = "http://" + base
+
+    # если хост приватный — оставляем как есть (http)
+    pr = urlparse(base)
+    if _is_private_host(pr.netloc):
+        return base
+
+    # публичный хост: не насилуем схему, берём ту, что уже стоит
+    return base
+
+def _build_webapp_url(params: dict) -> str:
+    return _webapp_base() + "/?" + urlencode(params, safe=":/?&=,+@")
 
 async def _build_workout_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> ReplyKeyboardMarkup:
     # читаем rest/window из кэша
