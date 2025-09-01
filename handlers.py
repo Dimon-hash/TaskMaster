@@ -7,6 +7,8 @@ from typing import List, Optional, Dict, Tuple
 from io import BytesIO
 from pathlib import Path
 
+from urllib.parse import urlencode, urlparse
+import ipaddress
 
 import aiohttp
 from telegram import (
@@ -18,6 +20,7 @@ from telegram import (
     InlineKeyboardButton,
     Message,
     InputMediaPhoto,
+    InputFile,
 )
 from telegram.ext import ContextTypes
 from telegram.error import BadRequest  # ✅ безопасное редактирование клавиатуры
@@ -87,10 +90,7 @@ def _ws_reset(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
 # ---------------- Утилиты ----------------
 def _is_admin(user_id: int) -> bool:
     try:
-        if user_id == getattr(settings, "ADMIN_ID", 0):
-            return True
-        admin_ids = set(getattr(settings, "ADMIN_IDS", []) or [])
-        return user_id in admin_ids
+        return user_id in set(getattr(settings, "ADMIN_IDS", []))
     except Exception:
         return False
 
@@ -129,16 +129,15 @@ async def _safe_cq_answer(cq, text: Optional[str] = None, **kwargs) -> None:
 from urllib.parse import urlencode, urlparse  # (объединил импорт)
 
 def _is_private_host(netloc: str) -> bool:
-    host = netloc.split(":")[0].lower()
-    return (
-        host in {"localhost", "127.0.0.1"} or
-        host.startswith("192.168.") or
-        host.startswith("10.") or
-        host.startswith("172.16.") or host.startswith("172.17.") or
-        host.startswith("172.18.") or host.startswith("172.19.") or
-        host.startswith("172.2")  # 172.20–172.31
-    )
-
+    host = (netloc or "").split(":", 1)[0].lower()
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback
+    except ValueError:
+        # доменное имя — считаем публичным
+        return False
 def _webapp_base() -> str:
     """
     Источник правды — settings.WEBAPP_ORIGIN (нормализуется в config.py).
@@ -1031,6 +1030,50 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=kb1
     )
 
+# ===== Стартовая ресинхронизация напоминаний для всех пользователей =====
+from types import SimpleNamespace
+
+async def reschedule_all_users(app) -> None:
+    """Поднять все run_daily задачи из БД после рестарта процесса."""
+    try:
+        async with Database.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT user_id, timezone, rest_seconds, workout_duration,
+                       training_form, reminder_enabled
+                  FROM users
+                 WHERE reminder_enabled = TRUE
+            """)
+        for r in rows:
+            uid = int(r["user_id"])
+            tz_name = r.get("timezone") or getattr(settings, "TIMEZONE", "Europe/Moscow")
+            _set_tz_for(uid, tz_name)
+            _set_rest_seconds_cached(uid, int(r.get("rest_seconds") or 60))
+
+            tf = _load_training_form(r.get("training_form"))
+            per_day_time = (tf.get("per_day_time") or {})
+            per_day_duration = (tf.get("per_day_duration") or None)
+
+            default_dur = int(
+                r.get("workout_duration")
+                or (next(iter(per_day_duration.values())) if per_day_duration else 60)
+            )
+            _set_window_seconds_cached(uid, default_dur * 60)
+
+            if per_day_time:
+                # делаем «псевдо-context», потому что _schedule_reminders_per_day ждёт context.application.job_queue
+                fake_ctx = SimpleNamespace(
+            application=SimpleNamespace(job_queue=app.job_queue),
+                    bot=app.bot,
+                )
+                _schedule_reminders_per_day(
+                    fake_ctx, uid, per_day_time, per_day_duration,
+                    default_duration_min=default_dur
+                )
+                _set_registered(uid, True)
+                logger.info("[startup] rescheduled user=%s days=%s",
+                            uid, list(per_day_time.keys()))
+    except Exception as e:
+        logger.exception("reschedule_all_users failed: %s", e)
 
 async def register_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # if not _reg_active(context):
@@ -1263,17 +1306,6 @@ async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_days_toggle_kb(st)
         )
 
-def _webapp_base() -> str:
-    base = (getattr(settings, "WEBAPP_URL", None) or getattr(settings, "PUBLIC_BASE_URL", "")).strip()
-    base = base.rstrip("/")
-    if base.startswith("http://"):
-        base = "https://" + base[len("http://"):]
-    if not base.startswith("https://"):
-        base = "https://" + base
-    return base
-
-def _build_webapp_url(params: dict) -> str:
-    return _webapp_base() + "/?" + urlencode(params, safe=":/?&=,+@")
 
 # ---------------- Сохранение настроек онбординга ----------------
 async def _persist_onboarding_schedule_per_day(user_id: int, context: ContextTypes.DEFAULT_TYPE, st: dict) -> Optional[str]:
@@ -2173,8 +2205,11 @@ async def _send_last_photos_with_reasons(context: ContextTypes.DEFAULT_TYPE, use
     for i, r in enumerate(rows[::-1], start=1):
         b = bytes(r.get("photo") or b"")
         cap = _cap(bool(r.get("verified")), str(r.get("gpt_reason") or ""), i)
+        bio = BytesIO(b)
+        bio.name = f"workout_{i}.jpg"
         try:
-            media.append(InputMediaPhoto(media=b, caption=cap[:1024]))
+            media.append(InputMediaPhoto(media=InputFile(bio, filename=bio.name),
+                                         caption=cap[:1024]))
         except Exception:
             media = []
             break
@@ -2223,212 +2258,155 @@ async def _update_deposit_in_db(user_id: int, deposit: int, deposit_days: int, r
             user_id, json.dumps(tf, ensure_ascii=False)
         )
 
+# ---------- PROFILE (drop-in) ----------
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    def _iso_to_local_str(iso_str: Optional[str], tz: ZoneInfo) -> Optional[str]:
-        if not iso_str:
-            return None
-        try:
-            dt = datetime.fromisoformat(iso_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=dt_timezone.utc)
-            return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return html.escape(str(iso_str))
-
-    message = update.message or update.callback_query.message
     user = update.effective_user
+    tz = _tz_for(user.id)
+    now = datetime.now(tz)
 
-    reminder_enabled = False
-    rtime: Optional[time] = None
-    duration_global: Optional[int] = None
-    per_day_time: Dict[str, str] = {}
-    per_day_duration: Dict[str, int] = {}
-    rest_seconds: Optional[int] = None
+    # читаем всё нужное из users
+    async with Database.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT username, first_name, last_name,
+                   reminder_enabled, reminder_days, reminder_time,
+                   workout_duration, rest_seconds, training_form, timezone
+              FROM users
+             WHERE user_id = $1
+        """, user.id)
 
-    answers: Dict[str, str] = {}
-    deposit = None
-    deposit_days = None
-    deposit_started_at = None
-    deposit_done_dates: List[str] = []
-
-    planned_week = 0
-    completed_week = 0
-    tf: Dict = {}
-
-    try:
-        async with Database.acquire() as conn:
-            row_user = await conn.fetchrow(
-                """
-                SELECT username, first_name, last_name,
-                       reminder_enabled, reminder_days, reminder_time,
-                       workout_duration, rest_seconds, training_form, registration_date, timezone
-                  FROM users
-                 WHERE user_id = $1
-                """,
-                user.id
-            )
-            if row_user:
-                tz_name = row_user.get("timezone") or getattr(settings, "TIMEZONE", "Europe/Moscow")
-                _set_tz_for(user.id, tz_name)
-
-                reminder_enabled = bool(row_user["reminder_enabled"])
-                rtime = row_user["reminder_time"]
-                duration_global = row_user["workout_duration"]
-                rest_seconds = row_user.get("rest_seconds")
-                _set_rest_seconds_cached(user.id, int(rest_seconds or 60))
-
-                tf = _load_training_form(row_user.get("training_form"))
-                per_day_time = tf.get("per_day_time") or {}
-                per_day_duration = tf.get("per_day_duration") or {}
-                answers = tf.get("answers") or {}
-
-                deposit = tf.get("deposit")
-                deposit_days = tf.get("deposit_days")
-                deposit_started_at = tf.get("deposit_started_at")
-                deposit_done_dates = list(tf.get("deposit_done_dates") or [])
-
-                if per_day_time:
-                    planned_week = len(per_day_time)
-                else:
-                    try:
-                        rdays = row_user.get("reminder_days") or []
-                        planned_week = len([d for d in rdays if d in ORDERED_DAYS])
-                    except Exception:
-                        planned_week = 0
-
-            tz = _tz_for(user.id)
-            dt_to = datetime.now(tz)
-            dt_from = dt_to - timedelta(days=7)
-
-            rows_sets = []
-            try:
-                rows_sets = await conn.fetch(
-                    """
-                    SELECT created_at, verified
-                      FROM sets
-                     WHERE user_id = $1
-                       AND created_at >= $2
-                    """,
-                    user.id,
-                    dt_from.astimezone(dt_timezone.utc)
-                )
-            except Exception:
-                try:
-                    rows_sets = await conn.fetch(
-                        """
-                        SELECT ts AS created_at, verified
-                          FROM sets
-                         WHERE user_id = $1
-                           AND ts >= $2
-                        """,
-                        user.id,
-                        dt_from.astimezone(dt_timezone.utc)
-                    )
-                except Exception:
-                    rows_sets = []
-
-            completed_days = set()
-            for r in rows_sets:
-                if not bool(r.get("verified")):
-                    continue
-                ts = r.get("created_at")
-                if not isinstance(ts, datetime):
-                    continue
-                ts_local = ts.astimezone(tz) if ts.tzinfo else ts.replace(tzinfo=tz)
-                completed_days.add(ts_local.date())
-
-            completed_week = len(completed_days)
-
-    except Exception as e:
-        logger.exception("profile() failed: %s", e)
-
-    percent_week = int((completed_week / planned_week) * 100) if planned_week else 0
-    week_bar = _progress_bar(completed_week, planned_week)
-
-    now_local = datetime.now(_tz_for(user.id))
-    tz_label = getattr(_tz_for(user.id), "key", str(_tz_for(user.id)))
-    today_line = now_local.strftime(f"%Y-%m-%d (%A) %H:%M")
-
-    if per_day_time:
-        sched_lines = _human_schedule_lines(per_day_time, per_day_duration or None)
-        sched_text = "\n".join(sched_lines)
-    else:
-        sched_text = (
-            f"Время: {rtime.strftime('%H:%M') if rtime else '—'}\n"
-            f"Длительность: {f'{duration_global} мин.' if duration_global else '—'}"
+    if not row:
+        await update.effective_message.reply_text(
+            "Профиль не найден. Пройди быструю регистрацию.",
+            reply_markup=_make_keyboard(False, user.id)
         )
-
-    _set_registered(user.id, bool(per_day_time))
-    rest_text = f"{rest_seconds} сек." if rest_seconds is not None else "—"
-
-    # Анкета — красиво вывести 3 ответа
-    qs = _reg_questions()
-    form_bits = []
-    if answers:
-        if "q1" in answers: form_bits.append(f"• {html.escape(qs[0])}\n{_h(answers['q1'])}")
-        if "q2" in answers: form_bits.append(f"• {html.escape(qs[1])}\n{_h(answers['q2'])}")
-        if "q3" in answers: form_bits.append(f"• {html.escape(qs[2])}\n{_h(answers['q3'])}")
-    form_bits.append(_format_deposit_status(tf, _tz_for(user.id)))
-
-    wt = (tf.get("workout_text") or "").strip()
-    wv = (tf.get("workout_video_url") or "").strip()
-    if wt:
-        form_bits.append(f"• План (текст): {_h(wt)}")
-    if wv:
-        form_bits.append(f"• План (видео): <a href=\"{_h(wv)}\">ссылка</a>")
-
-    form_text = "\n".join(form_bits) if form_bits else "—"
-
-    dep_days_total = int(deposit_days or 0)
-    dep_done = len(deposit_done_dates or [])
-    deposit_section = ""
-    try:
-        if dep_days_total > 0 and not bool(tf.get("deposit_forfeit")):
-            percent_dep = int(dep_done * 100 / dep_days_total)
-            started_str = _iso_to_local_str(deposit_started_at, _tz_for(user.id))
-            deposit_section = (
-                f"<b>💰 Прогресс по заморозке</b>\n"
-                f"{dep_done}/{dep_days_total} ({percent_dep}%)\n"
-                f"{_progress_bar(dep_done, dep_days_total)}"
-                + (f"\nСтарт окна: {html.escape(started_str)}" if started_str else "")
-                + "\n\n"
-            )
-    except Exception:
-        deposit_section = ""
-
-    html_text = (
-        f"<b>👤 Профиль @{_h(user.username) if user.username else user.id}</b>\n"
-        f"{_h(today_line)} ({_h(tz_label)})\n\n"
-        f"🔔 Напоминания: <b>{'включены' if reminder_enabled else 'выключены'}</b>\n\n"
-        f"<b>Дни/время/длительность</b>\n{sched_text}\n\n"
-        f"<b>Отдых</b>: {rest_text}\n\n"
-        f"<b>📝 Анкета</b>\n{form_text}\n\n"
-        f"{deposit_section}"
-        f"Режим тренировки: <b>{'активен' if _is_session_active(context, user.id) else 'выключен'}</b>"
-    )
-
-    reply_markup = _current_keyboard(context, user.id)
-    try:
-        if bool(tf.get("deposit_forfeit")):
-            await message.reply_text(
-                html_text, parse_mode="HTML",
-                reply_markup=_deposit_forfeit_kb()
-            )
-        elif dep_days_total > 0 and dep_done >= dep_days_total:
-            await message.reply_text(
-                html_text, parse_mode="HTML",
-                reply_markup=_deposit_complete_kb()
-            )
-        else:
-            await message.reply_text(
-                html_text, parse_mode="HTML",
-                reply_markup=reply_markup
-            )
         return
-    except Exception:
-        pass
 
-    await message.reply_text(html_text, parse_mode="HTML", reply_markup=reply_markup)
+    # TZ
+    tz_name = row.get("timezone") or getattr(settings, "TIMEZONE", "Europe/Moscow")
+    _set_tz_for(user.id, tz_name)
+    tz = _tz_for(user.id)
+
+    # Настройки
+    reminder_enabled = bool(row.get("reminder_enabled"))
+    rest_seconds = int(row.get("rest_seconds") or 60)
+
+    # training_form
+    # training_form (старое/тонкое расписание)
+    tf = _load_training_form(row.get("training_form"))
+    per_day_time: Dict[str, str] = (tf.get("per_day_time") or {})
+    per_day_duration: Optional[Dict[str, int]] = (tf.get("per_day_duration") or None)
+
+    # legacy (новые «каждый день 08:00 × 30» из мастера напоминаний)
+    legacy_days = list(row.get("reminder_days") or [])
+    t: Optional[time] = row.get("reminder_time")
+    dur = int(row.get("workout_duration") or 0)
+
+    legacy_time = {}
+    legacy_dur = None
+    if legacy_days and isinstance(t, time) and dur:
+        legacy_time = {d: t.strftime("%H:%M") for d in legacy_days}
+        legacy_dur = {d: dur for d in legacy_days}
+
+    # ✅ Приоритет: если legacy заполнен и по множеству дней отличается от TF — показываем legacy
+    if legacy_time:
+        tf_days = set((per_day_time or {}).keys())
+        legacy_days_set = set(legacy_time.keys())
+        if not per_day_time or (legacy_days_set != tf_days):
+            per_day_time = legacy_time
+            per_day_duration = legacy_dur
+
+    # Фолбэк на старые поля, если per_day_time ещё пуст
+    if not per_day_time:
+        legacy_days = list(row.get("reminder_days") or [])
+        t: Optional[time] = row.get("reminder_time")
+        dur = int(row.get("workout_duration") or 60)
+        if legacy_days and isinstance(t, time):
+            per_day_time = {d: t.strftime("%H:%M") for d in legacy_days}
+            per_day_duration = {d: dur for d in legacy_days}
+        else:
+            per_day_time = {}
+            per_day_duration = None
+
+    # Строки «Дни/время/длительность»
+    sched_lines = _human_schedule_lines(per_day_time, per_day_duration)
+
+    # Анкета
+    answers = tf.get("answers") or {}
+    a1 = str(answers.get("q1", "")).strip()
+    a2 = str(answers.get("q2", "")).strip()
+    a3 = str(answers.get("q3", "")).strip()
+
+    # Залог
+    dep_line = _format_deposit_status(tf, tz)
+    deposit_days = int(tf.get("deposit_days") or 0)
+    done_dates = list(tf.get("deposit_done_dates") or [])
+    done_cnt = len(done_dates)
+    progress_bar = _progress_bar(done_cnt, deposit_days, width=20)
+    started_at = (tf.get("deposit_started_at") or "").strip()
+
+    # План-текст/видео: короткий индикатор
+    has_plan_text = bool((tf.get("workout_text") or "").strip())
+    has_plan_video = bool((tf.get("workout_video_url") or "").strip())
+    plan_text_flag = "да" if has_plan_text else "—"
+    plan_video_flag = "да" if has_plan_video else "—"
+
+    # Режим тренировки (из вашего флага session_active)
+    session_on = _is_session_active(context, user.id)
+    session_line = "включен" if session_on else "выключен"
+
+    # Заголовок профиля
+    who = f"@{row.get('username')}" if row.get('username') else (user.first_name or str(user.id))
+    dt_str = now.strftime("%Y-%m-%d (%A) %H:%M")
+    header = f"👤 Профиль {who}\n{dt_str} ({tz.key})"
+
+    # Напоминания
+    bell = "включены" if reminder_enabled and per_day_time else "выключены"
+
+    parts = [
+        header,
+        "",
+        f"🔔 Напоминания: {bell}",
+        "",
+        "Дни/время/длительность",
+    ]
+
+    if sched_lines:
+        parts += [f"• {line}" for line in sched_lines]
+    else:
+        parts.append("• без расписания")
+
+    parts += [
+        "",
+        f"Отдых: {rest_seconds} сек.",
+        "",
+        "📝 Анкета",
+        f"• 1) Почему начинаешь сейчас? Что важно?\n{(a1 or '—')}",
+        f"• 2) Цель на 4 недели (измеримая)?\n{(a2 or '—')}",
+        f"• 3) Что чаще всего срывает и как обойти?\n{(a3 or '—')}",
+        f"{dep_line}",
+        f"• План (текст): {plan_text_flag}",
+        f"• План (видео): {plan_video_flag}",
+        "",
+        "💰 Прогресс по заморозке",
+        f"{done_cnt}/{deposit_days or 0} ({(0 if deposit_days == 0 else int(done_cnt*100/max(1,deposit_days)))}%)",
+        progress_bar,
+    ]
+    if started_at:
+        parts.append(f"Старт окна: {started_at}")
+
+    parts += [
+        "",
+        f"Режим тренировки: {session_line}",
+    ]
+
+    text = "\n".join(parts)
+
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=_current_keyboard(context, user.id)
+    )
+# ---------- end PROFILE ----------
+
 # ---------------- Админ-команды ----------------
 async def delete_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
