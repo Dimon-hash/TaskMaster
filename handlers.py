@@ -1,44 +1,34 @@
+import html  # ✅ безопасный HTML-вывод
+import json
 import logging
 import re
-import json
-import html  # ✅ безопасный HTML-вывод
 from datetime import datetime, timedelta, time, date, timezone as dt_timezone
-from typing import List, Optional, Dict, Tuple
 from io import BytesIO
 from pathlib import Path
-
-from urllib.parse import urlencode, urlparse
-import ipaddress
+from typing import List, Optional, Dict, Tuple
+from zoneinfo import ZoneInfo
 
 import aiohttp
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    WebAppInfo,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Message,
-    InputMediaPhoto,
-    InputFile,
-)
-from telegram.ext import ContextTypes
-from telegram.error import BadRequest  # ✅ безопасное редактирование клавиатуры
-
+from config import settings
 from database import Database
 from gpt_tasks import verify_task_with_gpt
-from config import settings
+from telegram import (Update, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo, InlineKeyboardMarkup,
+                      InlineKeyboardButton, Message, InputMediaPhoto, )
+from telegram.error import BadRequest  # ✅ безопасное редактирование клавиатуры
+from telegram.ext import ContextTypes
 
-from zoneinfo import ZoneInfo
 APP_TZ = ZoneInfo(getattr(settings, "TIMEZONE", "Europe/Moscow"))
 
 logger = logging.getLogger(__name__)
 
 # ======================= КЭШ/СЕССИИ/ТАЙМЗОНЫ =======================
-REST_CACHE: dict[int, int] = {}            # user_id -> rest_seconds (для URL WebApp)
+REST_CACHE: dict[int, int] = {}  # user_id -> rest_seconds (для URL WebApp)
 WORKOUT_WINDOW_CACHE: dict[int, int] = {}  # user_id -> seconds (длительность окна тренировки)
-TZ_CACHE: dict[int, ZoneInfo] = {}         # user_id -> ZoneInfo
+TZ_CACHE: dict[int, ZoneInfo] = {}  # user_id -> ZoneInfo
 REGISTERED_CACHE: set[int] = set()
+
+
+
 
 def _set_registered(user_id: int, ok: bool) -> None:
     if ok:
@@ -46,20 +36,26 @@ def _set_registered(user_id: int, ok: bool) -> None:
     else:
         REGISTERED_CACHE.discard(user_id)
 
+
 def _is_registered(user_id: int) -> bool:
     return user_id in REGISTERED_CACHE
+
 
 def _get_rest_seconds_cached(user_id: int) -> int:
     return int(REST_CACHE.get(user_id, 60))
 
+
 def _set_rest_seconds_cached(user_id: int, seconds: int) -> None:
     REST_CACHE[user_id] = max(1, int(seconds))
+
 
 def _get_window_seconds_cached(user_id: int) -> int:
     return int(WORKOUT_WINDOW_CACHE.get(user_id, 3600))
 
+
 def _set_window_seconds_cached(user_id: int, seconds: int) -> None:
     WORKOUT_WINDOW_CACHE[user_id] = max(60, int(seconds))
+
 
 def _set_tz_for(user_id: int, tz_name: Optional[str]) -> None:
     try:
@@ -67,14 +63,18 @@ def _set_tz_for(user_id: int, tz_name: Optional[str]) -> None:
     except Exception:
         tz = APP_TZ
     TZ_CACHE[user_id] = tz
+
+
 def _parse_deposit_from_text(s: str, default: int = 5000) -> int:
     m = re.search(r"\d{2,6}", (s or "").replace(" ", ""))
     if not m:
         return _clamp_deposit(default)
     return _clamp_deposit(int(m.group(0)))
 
+
 def _tz_for(user_id: int) -> ZoneInfo:
     return TZ_CACHE.get(user_id, APP_TZ)
+
 
 def _ws_get(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
     all_ws = context.application.bot_data.setdefault("workout_session", {})
@@ -84,15 +84,21 @@ def _ws_get(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
         all_ws[user_id] = ws
     return ws
 
+
 def _ws_reset(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     context.application.bot_data.setdefault("workout_session", {}).pop(user_id, None)
+
 
 # ---------------- Утилиты ----------------
 def _is_admin(user_id: int) -> bool:
     try:
-        return user_id in set(getattr(settings, "ADMIN_IDS", []))
+        if user_id == getattr(settings, "ADMIN_ID", 0):
+            return True
+        admin_ids = set(getattr(settings, "ADMIN_IDS", []) or [])
+        return user_id in admin_ids
     except Exception:
         return False
+
 
 def _extract_image_file_id_from_message(message) -> Optional[str]:
     if not message:
@@ -104,8 +110,10 @@ def _extract_image_file_id_from_message(message) -> Optional[str]:
         return doc.file_id
     return None
 
+
 # ✅ Безопасное редактирование инлайн-клавиатуры (игнор «Message is not modified»)
 from typing import Optional  # если не импортировал
+
 
 async def _safe_edit_reply_markup(message: Message, reply_markup: Optional[InlineKeyboardMarkup]) -> None:
     try:
@@ -114,6 +122,7 @@ async def _safe_edit_reply_markup(message: Message, reply_markup: Optional[Inlin
         if "Message is not modified" in str(e):
             return
         raise
+
 
 # ✅ ФИКС: не рекурсивно, а к telegram.CallbackQuery.answer
 async def _safe_cq_answer(cq, text: Optional[str] = None, **kwargs) -> None:
@@ -125,19 +134,19 @@ async def _safe_cq_answer(cq, text: Optional[str] = None, **kwargs) -> None:
             return
         raise
 
+
 # ---------------- Клавиатуры (главное меню) ----------------
 from urllib.parse import urlencode, urlparse  # (объединил импорт)
 
+
 def _is_private_host(netloc: str) -> bool:
-    host = (netloc or "").split(":", 1)[0].lower()
-    if host == "localhost":
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-        return ip.is_private or ip.is_loopback
-    except ValueError:
-        # доменное имя — считаем публичным
-        return False
+    host = netloc.split(":")[0].lower()
+    return (host in {"localhost", "127.0.0.1"} or host.startswith("192.168.") or host.startswith(
+        "10.") or host.startswith("172.16.") or host.startswith("172.17.") or host.startswith(
+        "172.18.") or host.startswith("172.19.") or host.startswith("172.2")  # 172.20–172.31
+            )
+
+
 def _webapp_base() -> str:
     """
     Источник правды — settings.WEBAPP_ORIGIN (нормализуется в config.py).
@@ -163,8 +172,10 @@ def _webapp_base() -> str:
     # публичный хост: не насилуем схему, берём ту, что уже стоит
     return base
 
+
 def _build_webapp_url(params: dict) -> str:
     return _webapp_base() + "/?" + urlencode(params, safe=":/?&=,+@")
+
 
 async def _build_workout_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> ReplyKeyboardMarkup:
     # читаем rest/window из кэша
@@ -184,13 +195,7 @@ async def _build_workout_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: i
         pass
 
     # собираем querystring безопасно
-    params = {
-        "mode": "workout",
-        "shots": "3",
-        "rest": str(rest_sec),
-        "window": str(window_sec),
-        "verify": "home",
-    }
+    params = {"mode": "workout", "shots": "3", "rest": str(rest_sec), "window": str(window_sec), "verify": "home", }
     if plan_text:
         params["plan_text"] = plan_text[:800]
     if plan_video:
@@ -202,64 +207,55 @@ async def _build_workout_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: i
     rows.append([KeyboardButton("📊 Профиль")] if _is_registered(user_id) else [KeyboardButton("📝 Регистрация")])
 
     if _is_admin(user_id):
-        rows.append([KeyboardButton("🟢 Старт тренировки (админ)"),
-                     KeyboardButton("🔴 Стоп тренировки (админ)")])
+        rows.append([KeyboardButton("🟢 Старт тренировки (админ)"), KeyboardButton("🔴 Стоп тренировки (админ)")])
         rows.append([KeyboardButton("/delete_db"), KeyboardButton("/clear_db")])
         rows.append([KeyboardButton("🧹 Очистить мои данные")])
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
 
 def _make_keyboard(is_workout: bool, user_id: int) -> ReplyKeyboardMarkup:
     rows = []
     if is_workout:
         rest_sec = _get_rest_seconds_cached(user_id)
         window_sec = _get_window_seconds_cached(user_id)
-        rows.append([
-            KeyboardButton(
-                "▶️ Начать тренировку",
-                web_app=WebAppInfo(
-                    url=_build_webapp_url({
-                        "mode": "workout",
-                        "shots": "3",
-                        "rest": str(rest_sec),
-                        "window": str(window_sec),
-                        "verify": "home",
-                    })
-                )
-            )
+        rows.append([KeyboardButton("▶️ Начать тренировку", web_app=WebAppInfo(url=_build_webapp_url(
+            {"mode": "workout", "shots": "3", "rest": str(rest_sec), "window": str(window_sec), "verify": "home", })))
 
-        ])
+                     ])
     if _is_registered(user_id):
         rows.append([KeyboardButton("📊 Профиль")])
     else:
         rows.append([KeyboardButton("📝 Регистрация")])
 
     if _is_admin(user_id):
-        rows.append([KeyboardButton("🟢 Старт тренировки (админ)"),
-                     KeyboardButton("🔴 Стоп тренировки (админ)")])
+        rows.append([KeyboardButton("🟢 Старт тренировки (админ)"), KeyboardButton("🔴 Стоп тренировки (админ)")])
         rows.append([KeyboardButton("/delete_db"), KeyboardButton("/clear_db")])
         rows.append([KeyboardButton("🧹 Очистить мои данные")])
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
 # Пути к локальным картинкам
 ASSET_IMG_1 = Path("assets/onboarding/01_runner.png")
 ASSET_IMG_2 = Path("assets/onboarding/02_icons.png")
+ASSET_IMG_3 = Path("assets/onboarding/03_lightning.png")
 
-async def _send_local_photo_or_text(bot, chat_id, img_path: Path, caption: str,
-                                    parse_mode: str = "Markdown", reply_markup=None):
+
+async def _send_local_photo_or_text(bot, chat_id, img_path: Path, caption: str, parse_mode: str = "Markdown",
+                                    reply_markup=None):
     """Если файл есть — отправим фото с подписью, иначе просто текст."""
     try:
         if img_path.exists():
             with img_path.open("rb") as f:
-                await bot.send_photo(chat_id=chat_id, photo=f, caption=caption,
-                                     parse_mode=parse_mode, reply_markup=reply_markup)
+                await bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode=parse_mode,
+                                     reply_markup=reply_markup)
         else:
-            await bot.send_message(chat_id=chat_id, text=caption,
-                                   parse_mode=parse_mode, reply_markup=reply_markup)
+            await bot.send_message(chat_id=chat_id, text=caption, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception:
         # На всякий случай fallback в текст
-        await bot.send_message(chat_id=chat_id, text=caption,
-                               parse_mode=parse_mode, reply_markup=reply_markup)
+        await bot.send_message(chat_id=chat_id, text=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+
 
 # ---------------- Инлайн-кнопки залога/депозита ----------------
 def _deposit_complete_kb(chosen: str | None = None, locked: bool = False) -> InlineKeyboardMarkup:
@@ -267,94 +263,63 @@ def _deposit_complete_kb(chosen: str | None = None, locked: bool = False) -> Inl
         mark = "✅ " if (chosen == cb) else ""
         data = "dep_locked" if locked else cb
         return InlineKeyboardButton(f"{mark}{text}", callback_data=data)
-    rows = [
-        [btn("🔁 Повторить заморозку", "depwin_repeat")],
-        [btn("✏️ Изменить залог", "depwin_change_amount")],
-        [btn("🗓 Изменить расписание", "depwin_change_sched")],
-        [btn("✖️ Позже", "depwin_later")],
-    ]
+
+    rows = [[btn("🔁 Повторить заморозку", "depwin_repeat")], [btn("✏️ Изменить залог", "depwin_change_amount")],
+            [btn("🗓 Изменить расписание", "depwin_change_sched")], [btn("✖️ Позже", "depwin_later")], ]
     return InlineKeyboardMarkup(rows)
+
 
 def _deposit_forfeit_kb(chosen: Optional[str] = None, locked: bool = False) -> InlineKeyboardMarkup:
     def btn(text: str, cb: str):
         mark = "✅ " if (chosen == cb) else ""
         data = "dep_locked" if locked else cb
         return InlineKeyboardButton(f"{mark}{text}", callback_data=data)
-    rows = [
-        [btn("🔁 Начать заново",      "depforf_restart")],
-        [btn("✏️ Изменить залог",     "depwin_change_amount")],
-        [btn("🗓 Изменить расписание","depwin_change_sched")],
-        [btn("✖️ Позже",              "depwin_later")],
-    ]
+
+    rows = [[btn("🔁 Начать заново", "depforf_restart")], [btn("✏️ Изменить залог", "depwin_change_amount")],
+            [btn("🗓 Изменить расписание", "depwin_change_sched")], [btn("✖️ Позже", "depwin_later")], ]
     return InlineKeyboardMarkup(rows)
+
 
 # ---------------- Прочие утилиты ----------------
 def _h(x: Optional[str]) -> str:
     return html.escape(str(x)) if x is not None else ""
 
+
 def days_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["пн ср пт", "вт чт сб", "пн-пт"],
-            ["каждый день", "сб вс", "без расписания"],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+    return ReplyKeyboardMarkup([["пн ср пт", "вт чт сб", "пн-пт"], ["каждый день", "сб вс", "без расписания"], ],
+                               resize_keyboard=True, one_time_keyboard=True, )
+
 
 def time_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["07:00", "08:00", "18:00"],
-            ["19:00", "19:30", "20:00"],
-            ["Другое время"],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+    return ReplyKeyboardMarkup([["07:00", "08:00", "18:00"], ["19:00", "19:30", "20:00"], ["Другое время"], ],
+                               resize_keyboard=True, one_time_keyboard=True, )
+
 
 def rest_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["30 сек", "60 сек", "90 сек"],
-            ["120 сек", "180 сек"],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+    return ReplyKeyboardMarkup([["30 сек", "60 сек", "90 сек"], ["120 сек", "180 сек"], ], resize_keyboard=True,
+                               one_time_keyboard=True, )
+
 
 def duration_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["30", "45", "60"],
-            ["75", "90"],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+    return ReplyKeyboardMarkup([["30", "45", "60"], ["75", "90"], ], resize_keyboard=True, one_time_keyboard=True, )
+
 
 def _current_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> ReplyKeyboardMarkup:
     active = bool(context.application.bot_data.get("session_active", {}).get(user_id))
     return _make_keyboard(active, user_id)
 
+
 # ---------------- Парсеры ----------------
-WEEKDAYS_MAP = {
-    'пн': 'mon', 'пон': 'mon', 'понедельник': 'mon',
-    'вт': 'tue', 'вторник': 'tue',
-    'ср': 'wed', 'среда': 'wed',
-    'чт': 'thu', 'четверг': 'thu',
-    'пт': 'fri', 'пятница': 'fri',
-    'сб': 'sat', 'суббота': 'sat',
-    'вс': 'sun', 'воскресенье': 'sun'
-}
+WEEKDAYS_MAP = {'пн': 'mon', 'пон': 'mon', 'понедельник': 'mon', 'вт': 'tue', 'вторник': 'tue', 'ср': 'wed',
+                'среда': 'wed', 'чт': 'thu', 'четверг': 'thu', 'пт': 'fri', 'пятница': 'fri', 'сб': 'sat',
+                'суббота': 'sat', 'вс': 'sun', 'воскресенье': 'sun'}
 ORDERED_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
 RU_BY_EN = {'mon': 'пн', 'tue': 'вт', 'wed': 'ср', 'thu': 'чт', 'fri': 'пт', 'sat': 'сб', 'sun': 'вс'}
 
-RU_FULL_TO_EN = {
-    'понедельник': 'mon', 'вторник': 'tue', 'среда': 'wed',
-    'четверг': 'thu', 'пятница': 'fri', 'суббота': 'sat', 'воскресенье': 'sun',
-}
+RU_FULL_TO_EN = {'понедельник': 'mon', 'вторник': 'tue', 'среда': 'wed', 'четверг': 'thu', 'пятница': 'fri',
+                 'суббота': 'sat', 'воскресенье': 'sun', }
 EN_TO_RU_FULL = {v: k.capitalize() for k, v in RU_FULL_TO_EN.items()}
+
 
 def _parse_time_hhmm(s: str) -> Optional[time]:
     m = re.search(r'(\d{1,2})[:.](\d{2})', s or "")
@@ -364,6 +329,7 @@ def _parse_time_hhmm(s: str) -> Optional[time]:
     if 0 <= hh < 24 and 0 <= mm < 60:
         return time(hour=hh, minute=mm)
     return None
+
 
 def _parse_days(s: str) -> List[str]:
     s = (s or "").strip().lower()
@@ -375,7 +341,7 @@ def _parse_days(s: str) -> List[str]:
     if rng:
         a, b = WEEKDAYS_MAP[rng.group(1)], WEEKDAYS_MAP[rng.group(2)]
         ia, ib = ORDERED_DAYS.index(a), ORDERED_DAYS.index(b)
-        return ORDERED_DAYS[ia:ib+1] if ia <= ib else ORDERED_DAYS[ia:]+ORDERED_DAYS[:ib+1]
+        return ORDERED_DAYS[ia:ib + 1] if ia <= ib else ORDERED_DAYS[ia:] + ORDERED_DAYS[:ib + 1]
     days = []
     for token in re.split(r'[,\s]+', s):
         token = token.strip()
@@ -389,10 +355,12 @@ def _parse_days(s: str) -> List[str]:
             seen.add(d)
     return uniq
 
+
 def _human_days(days: List[str]) -> str:
     if not days:
         return "без расписания"
     return " ".join(RU_BY_EN.get(d, d) for d in days)
+
 
 def _parse_rest_seconds(s: str) -> Optional[int]:
     s = (s or "").strip().lower()
@@ -409,6 +377,7 @@ def _parse_rest_seconds(s: str) -> Optional[int]:
         return max(1, val * 60)
     return max(1, val)
 
+
 def _parse_duration_minutes(s: str) -> Optional[int]:
     s = (s or "").strip().lower()
     if not s:
@@ -421,9 +390,9 @@ def _parse_duration_minutes(s: str) -> Optional[int]:
         return None
     return val
 
+
 # ---------------- Хелперы расписания/форматирования ----------------
-def _human_schedule_lines(per_day_time: Dict[str, str],
-                          per_day_duration: Optional[Dict[str, int]] = None) -> List[str]:
+def _human_schedule_lines(per_day_time: Dict[str, str], per_day_duration: Optional[Dict[str, int]] = None) -> List[str]:
     lines = []
     for d in ORDERED_DAYS:
         if d not in per_day_time:
@@ -436,6 +405,7 @@ def _human_schedule_lines(per_day_time: Dict[str, str],
             lines.append(f"• {ru} — {hhmm}")
     return lines
 
+
 def _progress_bar(done: int, total: int, width: int = 20) -> str:
     if total <= 0:
         return "—"
@@ -443,11 +413,13 @@ def _progress_bar(done: int, total: int, width: int = 20) -> str:
     filled = (p * width) // 100
     return "▰" * filled + "▱" * (width - filled)
 
+
 def _add_minutes_to_time(t: time, minutes: int, tz: ZoneInfo) -> Tuple[time, int]:
     base = datetime.combine(date(2000, 1, 3), time(t.hour, t.minute, t.second, t.microsecond, tzinfo=tz))
     dt2 = base + timedelta(minutes=minutes)
     day_shift = (dt2.date() - base.date()).days
     return dt2.timetz(), day_shift
+
 
 # ===== helper: безопасное чтение training_form из БД (str|dict) =====
 def _load_training_form(tf_raw) -> Dict:
@@ -459,6 +431,7 @@ def _load_training_form(tf_raw) -> Dict:
         except Exception:
             return {}
     return {}
+
 
 def _format_deposit_status(tf: dict, tz: ZoneInfo) -> str:
     dep = tf.get("deposit")
@@ -492,6 +465,7 @@ def _format_deposit_status(tf: dict, tz: ZoneInfo) -> str:
         return f"• Залог: {dep} ₽ (осталось {left} ₽)"
     return f"• Залог: {dep} ₽ (на кону)"
 
+
 # ---------------- Планировщик напоминаний ----------------
 def _clear_user_jobs(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     jq = getattr(context.application, "job_queue", None)
@@ -503,11 +477,12 @@ def _clear_user_jobs(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
         except Exception as e:
             logger.exception("Failed to list/remove jobs: %s", e)
 
+
 async def clear_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_admin(user.id):
         await update.effective_message.reply_text("🚫 Доступ запрещён.",
-            reply_markup=_current_keyboard(context, user.id))
+                                                  reply_markup=_current_keyboard(context, user.id))
         return
     try:
         async with Database.acquire() as conn:
@@ -519,8 +494,7 @@ async def clear_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await conn.execute("DELETE FROM sets  WHERE user_id=$1", user.id)
             except Exception:
                 pass
-            await conn.execute(
-                """
+            await conn.execute("""
                 UPDATE users
                    SET reminder_enabled = FALSE,
                        reminder_days = ARRAY[]::text[],
@@ -529,29 +503,22 @@ async def clear_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        rest_seconds = 60,
                        training_form = NULL
                  WHERE user_id = $1
-                """,
-                user.id
-            )
+                """, user.id)
 
         _clear_user_jobs(context, user.id)
         _set_session_active(context, user.id, False)
         REST_CACHE.pop(user.id, None)
         WORKOUT_WINDOW_CACHE.pop(user.id, None)
 
-        await update.effective_message.reply_text(
-            "✅ Твои данные очищены. Напоминания выключены.",
-            reply_markup=_make_keyboard(False, user.id)
-        )
+        await update.effective_message.reply_text("✅ Твои данные очищены. Напоминания выключены.",
+                                                  reply_markup=_make_keyboard(False, user.id))
     except Exception as e:
         logger.exception("clear_my_data failed: %s", e)
-        await update.effective_message.reply_text(
-            "⚠️ Ошибка при очистке твоих данных.",
-            reply_markup=_make_keyboard(False, user.id)
-        )
+        await update.effective_message.reply_text("⚠️ Ошибка при очистке твоих данных.",
+                                                  reply_markup=_make_keyboard(False, user.id))
 
-def _schedule_reminders_per_day(context: ContextTypes.DEFAULT_TYPE,
-                                user_id: int,
-                                per_day_time: Dict[str, str],
+
+def _schedule_reminders_per_day(context: ContextTypes.DEFAULT_TYPE, user_id: int, per_day_time: Dict[str, str],
                                 per_day_duration: Optional[Dict[str, int]] = None,
                                 default_duration_min: int = 60) -> None:
     jq = getattr(context.application, "job_queue", None)
@@ -584,7 +551,7 @@ def _schedule_reminders_per_day(context: ContextTypes.DEFAULT_TYPE,
         mid_t, mid_shift = _add_minutes_to_time(t_z, max(dur // 2, 1), tz)
         end_t, end_shift = _add_minutes_to_time(t_z, dur, tz)
 
-        base_day = (day_idx[d]+1) % 7
+        base_day = (day_idx[d] + 1) % 7
         mid_day = (base_day + mid_shift) % 7
         end_day = (base_day + end_shift) % 7
 
@@ -610,11 +577,9 @@ def _schedule_reminders_per_day(context: ContextTypes.DEFAULT_TYPE,
             kb = await _build_workout_keyboard(ctx, uid)
 
             try:
-                await ctx.bot.send_message(
-                    chat_id=uid,
-                    text=f"{intro_line}{money_line}\nБудет 3 снимка с паузами отдыха.",
-                    reply_markup=kb
-                )
+                await ctx.bot.send_message(chat_id=uid,
+                                           text=f"{intro_line}{money_line}\nБудет 3 снимка с паузами отдыха.",
+                                           reply_markup=kb)
             except Exception:
                 logger.exception("Failed to send START reminder")
 
@@ -639,28 +604,24 @@ def _schedule_reminders_per_day(context: ContextTypes.DEFAULT_TYPE,
         async def mid_cb(ctx: ContextTypes.DEFAULT_TYPE, uid=user_id):
             _set_session_active(ctx, uid, True)
             try:
-                await ctx.bot.send_message(
-                    chat_id=uid,
-                    text="⏳ Середина — держи темп. Если ещё не начал, жми «▶️ Начать тренировку».",
-                    reply_markup=_make_keyboard(True, uid)
-                )
+                await ctx.bot.send_message(chat_id=uid,
+                                           text="⏳ Середина — держи темп. Если ещё не начал, жми «▶️ Начать тренировку».",
+                                           reply_markup=_make_keyboard(True, uid))
             except Exception:
                 logger.exception("Failed to send MID reminder")
 
         async def end_cb(ctx: ContextTypes.DEFAULT_TYPE, uid=user_id):
             _set_session_active(ctx, uid, False)
             try:
-                await ctx.bot.send_message(
-                    chat_id=uid,
-                    text="✅ Конец тренировочного окна.",
-                    reply_markup=_make_keyboard(False, uid)
-                )
+                await ctx.bot.send_message(chat_id=uid, text="✅ Конец тренировочного окна.",
+                                           reply_markup=_make_keyboard(False, uid))
             except Exception:
                 logger.exception("Failed to send END reminder")
 
-        jq.run_daily(start_cb, time=t_z,   days=(base_day,), name=f"{user_id}:{d}:start")
-        jq.run_daily(mid_cb,   time=mid_t, days=(mid_day,),  name=f"{user_id}:{d}:mid")
-        jq.run_daily(end_cb,   time=end_t, days=(end_day,),  name=f"{user_id}:{d}:end")
+        jq.run_daily(start_cb, time=t_z, days=(base_day,), name=f"{user_id}:{d}:start")
+        jq.run_daily(mid_cb, time=mid_t, days=(mid_day,), name=f"{user_id}:{d}:mid")
+        jq.run_daily(end_cb, time=end_t, days=(end_day,), name=f"{user_id}:{d}:end")
+
 
 # ---------------- Помощники сессии ----------------
 def _set_session_active(context: ContextTypes.DEFAULT_TYPE, user_id: int, active: bool) -> None:
@@ -670,20 +631,19 @@ def _set_session_active(context: ContextTypes.DEFAULT_TYPE, user_id: int, active
     else:
         sa.pop(user_id, None)
 
+
 def _is_session_active(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     return bool(context.application.bot_data.get("session_active", {}).get(user_id))
+
 
 async def _reschedule_from_db(update_or_context, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     try:
         async with Database.acquire() as conn:
-            row = await conn.fetchrow(
-                """
+            row = await conn.fetchrow("""
                 SELECT reminder_enabled, reminder_days, reminder_time, workout_duration, rest_seconds, training_form, timezone
                   FROM users
                  WHERE user_id = $1
-                """,
-                user_id
-            )
+                """, user_id)
         if not row:
             return
 
@@ -705,10 +665,12 @@ async def _reschedule_from_db(update_or_context, context: ContextTypes.DEFAULT_T
         per_day_duration = tf.get("per_day_duration") or None
 
         if per_day_time:
-            _schedule_reminders_per_day(context, user_id, per_day_time, per_day_duration, default_duration_min=default_dur)
+            _schedule_reminders_per_day(context, user_id, per_day_time, per_day_duration,
+                                        default_duration_min=default_dur)
         _set_registered(user_id, bool(per_day_time))
     except Exception as e:
         logger.exception("_reschedule_from_db failed: %s", e)
+
 
 # ---------------- Залог: списание ----------------
 async def _forfeit_deposit(context: ContextTypes.DEFAULT_TYPE, user_id: int, reason: str) -> None:
@@ -730,17 +692,13 @@ async def _forfeit_deposit(context: ContextTypes.DEFAULT_TYPE, user_id: int, rea
         tf["deposit_left"] = 0
 
         async with Database.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET training_form=$2 WHERE user_id=$1",
-                user_id, json.dumps(tf, ensure_ascii=False)
-            )
+            await conn.execute("UPDATE users SET training_form=$2 WHERE user_id=$1", user_id,
+                               json.dumps(tf, ensure_ascii=False))
 
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"❌ Залог {deposit} ₽ списан: {reason}"
-        )
+        await context.bot.send_message(chat_id=user_id, text=f"❌ Залог {deposit} ₽ списан: {reason}")
     except Exception as e:
         logger.exception("_forfeit_deposit failed: %s", e)
+
 
 # ===================== AI-залог =====================
 try:
@@ -748,44 +706,38 @@ try:
 except Exception:
     recommend_deposit_with_gpt = None  # fallback ниже
 
+
 def _clamp_deposit(v: int) -> int:
     return max(500, min(int(v), 100_000))
+
 
 def _build_onboarding_profile(user, st: dict) -> dict:
     per_day_time = st.get("schedule_map_time") or {}
     per_day_duration = st.get("schedule_map_duration") or {}
     dur_common = st.get("duration_common_min")
-    return {
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "first_name": user.first_name,
-            "last_name": user.last_name,
-        },
-        "answers": st.get("answers") or {},  # ← новые ответы (3 вопроса)
-        "schedule": {
-            "per_day_time": per_day_time,
-            "per_day_duration": per_day_duration if per_day_duration else None,
-            "duration_common_min": dur_common,
-        },
-        "rest_seconds": st.get("rest_seconds"),
-        "program_price": st.get("program_price"),  # если где-то попадётся
-    }
+    return {"user": {"id": user.id, "username": user.username, "first_name": user.first_name,
+                     "last_name": user.last_name, }, "answers": st.get("answers") or {},  # ← новые ответы (3 вопроса)
+            "schedule": {"per_day_time": per_day_time,
+                         "per_day_duration": per_day_duration if per_day_duration else None,
+                         "duration_common_min": dur_common, }, "rest_seconds": st.get("rest_seconds"),
+            "program_price": st.get("program_price"),  # если где-то попадётся
+            }
+
 
 async def _ai_recommend_deposit(user, st: dict) -> tuple[int, str]:
     profile = _build_onboarding_profile(user, st)
-
+    base_min = 5000
     if callable(recommend_deposit_with_gpt):
         try:
-            resp = await recommend_deposit_with_gpt(profile)  # {"deposit": int, "reason": str}
-            dep = _clamp_deposit(int(resp.get("deposit", 5000)))
+            resp = await recommend_deposit_with_gpt(profile)
+            dep = max(base_min, _clamp_deposit(int(resp.get("deposit", base_min))))
             reason = str(resp.get("reason") or "ИИ-рекомендация по анкете")
             return dep, reason
         except Exception:
             pass
 
     # Fallback-эвристика — без привязки к старым полям
-    dep = 5000
+    dep = max(base_min, 5000)
     per_day_time = (profile.get("schedule") or {}).get("per_day_time") or {}
     days_cnt = len(per_day_time)
     if days_cnt >= 4:
@@ -802,7 +754,7 @@ async def _ai_recommend_deposit(user, st: dict) -> tuple[int, str]:
         elif per_day_duration:
             vals = [int(x) for x in per_day_duration.values() if x]
             if vals:
-                avg_dur = sum(vals)//len(vals)
+                avg_dur = sum(vals) // len(vals)
     except Exception:
         pass
     if avg_dur and avg_dur >= 60:
@@ -817,8 +769,9 @@ async def _ai_recommend_deposit(user, st: dict) -> tuple[int, str]:
     except Exception:
         pass
 
-    dep = _clamp_deposit(dep)
+    dep = max(base_min, _clamp_deposit(dep))
     return dep, "Резервная эвристика (ИИ недоступен)"
+
 
 async def _auto_deposit_and_finish(message: Message, update: Update, context: ContextTypes.DEFAULT_TYPE, st: dict):
     user = update.effective_user
@@ -834,11 +787,9 @@ async def _auto_deposit_and_finish(message: Message, update: Update, context: Co
 
     st["step"] = "deposit_choice"
 
+
 # ===================== КОСМЕТИКА РЕГИСТРАЦИИ (инлайн) =====================
-DAY_LABELS = [
-    ("mon", "Пн"), ("tue", "Вт"), ("wed", "Ср"),
-    ("thu", "Чт"), ("fri", "Пт"), ("sat", "Сб"), ("sun", "Вс"),
-]
+DAY_LABELS = [("mon", "Пн"), ("tue", "Вт"), ("wed", "Ср"), ("thu", "Чт"), ("fri", "Пт"), ("sat", "Сб"), ("sun", "Вс"), ]
 EN2RU_SHORT = dict(DAY_LABELS)
 RU_FULL_BY_EN = EN_TO_RU_FULL
 
@@ -846,58 +797,60 @@ TIME_PRESETS = ["07:00", "08:00", "18:00", "19:00", "19:30", "20:00"]
 DUR_PRESETS = [30, 45, 60, 75, 90]
 REST_PRESETS = [30, 60, 90, 120, 180]
 
+
 def _days_toggle_kb(st: dict) -> InlineKeyboardMarkup:
     chosen = set(st.get("chosen_days", []))
-    rows = []
-    buf = []
+    rows, buf = [], []
     for i, (key, label) in enumerate(DAY_LABELS, 1):
-        mark = "✅ " if key in chosen else ""
+        mark = "🔥 " if key in chosen else ""
         buf.append(InlineKeyboardButton(f"{mark}{label}", callback_data=f"days_toggle:{key}"))
         if i % 3 == 0:
-            rows.append(buf); buf = []
+            rows.append(buf);
+            buf = []
     if buf:
         rows.append(buf)
-    rows.append([InlineKeyboardButton("🧹 Сбросить", callback_data="days_clear"),
-                 InlineKeyboardButton("Готово ▶️", callback_data="days_done")])
+    rows.append([InlineKeyboardButton("✅ Готово", callback_data="days_done")])
     return InlineKeyboardMarkup(rows)
 
+
 def _time_kb_for_day(day_en: str, current: Optional[str] = None) -> InlineKeyboardMarkup:
-    rows = []
-    buf = []
+    rows, buf = [], []
     for i, t in enumerate(TIME_PRESETS, 1):
         mark = "✅ " if current == t else ""
         buf.append(InlineKeyboardButton(f"{mark}{t}", callback_data=f"time_pick:{day_en}:{t}"))
         if i % 3 == 0:
-            rows.append(buf); buf = []
+            rows.append(buf);
+            buf = []
     if buf:
         rows.append(buf)
-    rows.append([InlineKeyboardButton("⌨️ Другое время", callback_data=f"time_custom:{day_en}")])
+    # без «Другое время» — ручной ввод принимаем сразу текстом
     return InlineKeyboardMarkup(rows)
+
 
 def _rest_inline_kb() -> InlineKeyboardMarkup:
     rows = []
     buf = []
     for i, v in enumerate(REST_PRESETS, 1):
-        label = f"{v//60}:{v%60:02d}" if v >= 60 else f"{v}с"
+        label = f"{v // 60}:{v % 60:02d}" if v >= 60 else f"{v}с"
         buf.append(InlineKeyboardButton(label, callback_data=f"rest:{v}"))
         if i % 3 == 0:
-            rows.append(buf); buf = []
+            rows.append(buf);
+            buf = []
     if buf:
         rows.append(buf)
     rows.append([InlineKeyboardButton("⌨️ Другое", callback_data="rest_custom")])
     return InlineKeyboardMarkup(rows)
 
+
 def _dur_mode_inline_kb_pretty() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Одинаковая длительность", callback_data="dur_same")],
-        [InlineKeyboardButton("Разная по дням", callback_data="dur_diff")],
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Одинаковая длительность", callback_data="dur_same")],
+                                 [InlineKeyboardButton("Разная по дням", callback_data="dur_diff")], ])
+
 
 def _deposit_choice_kb(dep: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"👍 Согласен с {dep} ₽", callback_data="dep_ok")],
-        [InlineKeyboardButton("✏️ Ввести свою сумму", callback_data="dep_custom")],
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Внести свой залог", callback_data="dep_custom")],
+                                 [InlineKeyboardButton("✅ Согласен с залогом", callback_data="dep_ok")], ])
+
 
 def _dur_common_kb(current: int = 60) -> InlineKeyboardMarkup:
     rows = []
@@ -906,18 +859,18 @@ def _dur_common_kb(current: int = 60) -> InlineKeyboardMarkup:
         mark = "✅ " if v == current else ""
         buf.append(InlineKeyboardButton(f"{mark}{v} мин", callback_data=f"dur_common_set:{v}"))
         if i % 3 == 0:
-            rows.append(buf); buf = []
+            rows.append(buf);
+            buf = []
     if buf:
         rows.append(buf)
-    rows.append([
-        InlineKeyboardButton("−5", callback_data="dur_common_adj:-5"),
-        InlineKeyboardButton("−1", callback_data="dur_common_adj:-1"),
-        InlineKeyboardButton("+1", callback_data="dur_common_adj:+1"),
-        InlineKeyboardButton("+5", callback_data="dur_common_adj:+5"),
-    ])
+    rows.append([InlineKeyboardButton("−5", callback_data="dur_common_adj:-5"),
+                 InlineKeyboardButton("−1", callback_data="dur_common_adj:-1"),
+                 InlineKeyboardButton("+1", callback_data="dur_common_adj:+1"),
+                 InlineKeyboardButton("+5", callback_data="dur_common_adj:+5"), ])
     rows.append([InlineKeyboardButton("⌨️ Другое (ввести)", callback_data="dur_common_custom"),
                  InlineKeyboardButton("Готово ▶️", callback_data="dur_common_done")])
     return InlineKeyboardMarkup(rows)
+
 
 def _dur_perday_kb(day_en: str, current: int = 60) -> InlineKeyboardMarkup:
     rows = []
@@ -926,82 +879,114 @@ def _dur_perday_kb(day_en: str, current: int = 60) -> InlineKeyboardMarkup:
         mark = "✅ " if v == current else ""
         buf.append(InlineKeyboardButton(f"{mark}{v} мин", callback_data=f"dur_pd_set:{day_en}:{v}"))
         if i % 3 == 0:
-            rows.append(buf); buf = []
+            rows.append(buf);
+            buf = []
     if buf:
         rows.append(buf)
     rows.append([InlineKeyboardButton("⌨️ Другое", callback_data=f"dur_pd_custom:{day_en}")])
     return InlineKeyboardMarkup(rows)
 
-# ===================== НОВАЯ РЕГИСТРАЦИЯ (с 2 фото и 3 вопросами) =====================
-ONBOARDING_TEXT_1 = (
-    "Я — Foscar, твой личный тренер и строгий напарник 🥷.\n\n"
-    "Сейчас ты в состоянии *неосознанного оптимизма*. "
-    "Мотивация спадёт — я удержу тебя в колее ⚡️"
-)
 
-ONBOARDING_TEXT_2 = (
-    "🔥 {name}, настало время для первого шага.\n\n"
-    "✨ Чтобы я мог вести тебя максимально эффективно, мне нужно немного узнать о тебе. "
-    "Всего 3 коротких вопроса — и ты поможешь себе выстроить прочный фундамент для дисциплины и результата.\n\n"
-    "🎯 Поймём, что действительно тобой движет.\n"
-    "🛡 Определим твои сильные и слабые стороны.\n"
-    "💰 Найдём сумму залога, которая будет держать тебя в игре.\n\n"
-    "⚔️ Отвечая честно, ты помогаешь самому себе. Я не дам тебе свернуть с пути.\n\n"
-    "👇 Готов? Нажми кнопку, и начнём."
-)
+# ===================== НОВАЯ РЕГИСТРАЦИЯ (с 2 фото и 3 вопросами) =====================
+from telegram.error import BadRequest
+
+async def _send_local_photo_or_text(bot, chat_id, img_path, caption, parse_mode="Markdown", reply_markup=None):
+    try:
+        if img_path.exists():
+            with img_path.open("rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f, caption=caption,
+                                     parse_mode=parse_mode, reply_markup=reply_markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=caption,
+                                   parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    except BadRequest:
+        # Повтор без разметки
+        if img_path.exists():
+            with img_path.open("rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f, caption=caption,
+                                     parse_mode=None, reply_markup=reply_markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=caption,
+                                   parse_mode=None, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    # Финальный фолбэк
+    try:
+        await bot.send_message(chat_id=chat_id, text=caption, parse_mode=None, reply_markup=reply_markup)
+    except Exception:
+        pass
+
+ONBOARDING_TEXT_1 = ("🔥 ДОВЕДИ ДЕЛО ДО КОНЦА 🔥\n\n"
+                     "👋 Привет, {name}!\n"
+                     "Я — Foscar, твой личный тренер и строгий напарник 🥷.\n\n"
+                     "💢 Сейчас ты на эмоциях.\n"
+                     "Мотивация обманчива — завтра её не будет. Останется только дисциплина.\n\n"
+                     "⚡️ Хватит ждать. Действуй!")
+
+ONBOARDING_TEXT_2 = ("🔥 {name}, настало время для первого шага.\n\n"
+                     "✨ Мне нужно узнать о тебе чуть больше. Всего 3 вопроса — и ты поможешь себе выстроить "
+                     "прочный фундамент дисциплины и результата.\n\n"
+                     "🎯 Поймём, что тобой движет.\n"
+                     "🛡 Определим твои сильные и слабые стороны.\n"
+                     "💰 Подберём залог, который мотивирует тебя следовать целям.\n\n"
+                     "⚔️ Отвечай честно. Это шаг к твоему будущему без отмазок.\n\n"
+                     "👇 Начинаем прямо сейчас.")
+ONBOARDING_TEXT_3 = ("🎯 Твоя картина:\n"
+                     "Ты уже пробовал тренироваться по программам, но мотивация угасала. "
+                     "Решение начать сейчас — твой осознанный выбор, а не чей-то совет. "
+                     "Главный барьер — нехватка времени и усталость после работы. "
+                     "Это значит, что нам нужно простое, но жёсткое расписание и напоминания, "
+                     "которые не дадут тебе сорваться.\n\n"
+                     "⚡️ Следующий шаг — зафиксируй своё расписание тренировок. "
+                     "Чёткие дни и время включат тебя в режим привычки.\n\n"
+                     "🛡 Создай свою дисциплину. Сейчас.")
 
 def _reg_questions() -> List[str]:
-    # Можно переопределить в settings.ONBOARDING_QUESTIONS = ["...", "...", "..."]
     qs = getattr(settings, "ONBOARDING_QUESTIONS", None)
     if isinstance(qs, (list, tuple)) and len(qs) >= 3:
         return [str(qs[0]), str(qs[1]), str(qs[2])]
-    # Дефолт — нейтральные формулировки
-    return [
-        "1) Почему ты начинаешь сейчас? Что для тебя важно?",
-        "2) Какая конкретная цель на ближайшие 4 недели (измеримая)?",
-        "3) Что тебя чаще всего срывает и как мы это обойдём?",
-    ]
+    return ["🔥 {name}, ты уже пробовал тренироваться с программами или тренером?",
+            "🚀 {name}, ты решил начать сам или по совету кого-то?",
+            "⚡️ {name}, что тебе сложнее всего — найти время или энергию для тренировки?", ]
+
 
 def _reg_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.user_data.setdefault("reg", {})
 
+
 def _reg_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return "reg" in context.user_data
 
+
 async def _already_registered(user_id: int) -> bool:
     async with Database.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT training_form FROM users WHERE user_id = $1",
-            user_id
-        )
+        row = await conn.fetchrow("SELECT training_form FROM users WHERE user_id = $1", user_id)
     tf = _load_training_form(row.get("training_form") if row else None)
     per_day_time = (tf or {}).get("per_day_time") or {}
     return bool(per_day_time)
+
 
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
 
     if await _already_registered(user.id):
-        await msg.reply_text(
-            "Ты уже прошёл онбординг — повторная регистрация не нужна.\n",
-            reply_markup=_make_keyboard(False, user.id)
-        )
+        await msg.reply_text("Ты уже прошёл онбординг — повторная регистрация не нужна.\n",
+                             reply_markup=_make_keyboard(False, user.id))
         return
 
     # создаём пользователя при необходимости (как у тебя было)
     async with Database.acquire() as conn:
         row = await conn.fetchrow("SELECT user_id, rest_seconds, timezone FROM users WHERE user_id=$1", user.id)
         if not row:
-            await conn.execute(
-                """
+            await conn.execute("""
                 INSERT INTO users (user_id, username, first_name, last_name, timezone)
                 VALUES ($1,$2,$3,$4,$5)
                 ON CONFLICT (user_id) DO NOTHING
-                """,
-                user.id, user.username, user.first_name, user.last_name,
-                getattr(settings, "TIMEZONE", "Europe/Moscow")
-            )
+                """, user.id, user.username, user.first_name, user.last_name,
+                               getattr(settings, "TIMEZONE", "Europe/Moscow"))
             _set_rest_seconds_cached(user.id, 60)
             _set_tz_for(user.id, getattr(settings, "TIMEZONE", "Europe/Moscow"))
         else:
@@ -1010,7 +995,8 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st = _reg_state(context)
     st.clear()
-    st["name"] = user.first_name or (user.username and f"@{user.username}") or "друг"
+    disp = (f"@{user.username}" if user.username else (user.first_name or None)) or "name"
+    st["name"] = disp
     st["step"] = "await_qa_begin"
     st["answers"] = {}
     st["schedule_map_time"] = {}
@@ -1022,118 +1008,19 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.pin_chat_message(chat_id=msg.chat_id, message_id=pinned.message_id)
     except Exception:
         pass
-
+    disp = (f"@{user.username}" if user.username else (user.first_name or "друг"))
+    text = ONBOARDING_TEXT_1.format(name=html.escape(disp))
     # Экран №1 — ТОЛЬКО он + кнопка «Дальше»
-    kb1 = InlineKeyboardMarkup([[InlineKeyboardButton("Дальше ▶️", callback_data="ob_next")]])
+    kb1 = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готов действовать", callback_data="ob_next")]])
+
     await _send_local_photo_or_text(
-        context.bot, msg.chat_id, ASSET_IMG_1, ONBOARDING_TEXT_1,
-        parse_mode="Markdown", reply_markup=kb1
+        context.bot,
+        msg.chat_id,
+        ASSET_IMG_1,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb1
     )
-
-# ===== Стартовая ресинхронизация напоминаний для всех пользователей =====
-from types import SimpleNamespace
-
-async def reschedule_all_users(app) -> None:
-    """Поднять все run_daily задачи из БД после рестарта процесса."""
-    try:
-        async with Database.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT user_id, timezone, rest_seconds, workout_duration,
-                       training_form, reminder_enabled
-                  FROM users
-                 WHERE reminder_enabled = TRUE
-            """)
-        for r in rows:
-            uid = int(r["user_id"])
-            tz_name = r.get("timezone") or getattr(settings, "TIMEZONE", "Europe/Moscow")
-            _set_tz_for(uid, tz_name)
-            _set_rest_seconds_cached(uid, int(r.get("rest_seconds") or 60))
-
-            tf = _load_training_form(r.get("training_form"))
-            per_day_time = (tf.get("per_day_time") or {})
-            per_day_duration = (tf.get("per_day_duration") or None)
-
-            default_dur = int(
-                r.get("workout_duration")
-                or (next(iter(per_day_duration.values())) if per_day_duration else 60)
-            )
-            _set_window_seconds_cached(uid, default_dur * 60)
-
-            if per_day_time:
-                # делаем «псевдо-context», потому что _schedule_reminders_per_day ждёт context.application.job_queue
-                fake_ctx = SimpleNamespace(
-            application=SimpleNamespace(job_queue=app.job_queue),
-                    bot=app.bot,
-                )
-                _schedule_reminders_per_day(
-                    fake_ctx, uid, per_day_time, per_day_duration,
-                    default_duration_min=default_dur
-                )
-                _set_registered(uid, True)
-                logger.info("[startup] rescheduled user=%s days=%s",
-                            uid, list(per_day_time.keys()))
-    except Exception as e:
-        logger.exception("reschedule_all_users failed: %s", e)
-
-async def register_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # if not _reg_active(context):
-    #     return
-    # st = _reg_state(context)
-    # step = st.get("step")
-    #
-    # if step not in ("photo1", "photo2"):
-    #     return
-    #
-    # msg = update.effective_message
-    # file_id = _extract_image_file_id_from_message(update.message)
-    # if not file_id:
-    #     await msg.reply_text("Это не похоже на фото. Пришли фото как изображение 🙏")
-    #     return
-    #
-    # # сохраняем id, чтобы потом (опционально) утянуть из Telegram
-    # st["photos"].append(file_id)
-    #
-    # # фото №1 -> отправляем Текст 1 с фото + просим фото №2
-    # if step == "photo1":
-    #     try:
-    #         await context.bot.send_photo(
-    #             chat_id=msg.chat_id,
-    #             photo=file_id,
-    #             caption=ONBOARDING_TEXT_1,
-    #             parse_mode="Markdown"
-    #         )
-    #     except Exception:
-    #         await msg.reply_text(ONBOARDING_TEXT_1, parse_mode="Markdown")
-    #
-    #     st["step"] = "photo2"
-    #     await msg.reply_text("📷 Отлично. Теперь пришли *второе* фото (№2) — я приложу его к тексту #2.", parse_mode="Markdown")
-    #     return
-    #
-    # # фото №2 -> отправляем Текст 2 с фото + кнопка "Начать 3 вопроса"
-    # if step == "photo2":
-    #     name = st.get("name", "друг")
-    #     text2 = ONBOARDING_TEXT_2.format(name=name)
-    #     try:
-    #         await context.bot.send_photo(
-    #             chat_id=msg.chat_id,
-    #             photo=file_id,
-    #             caption=text2,
-    #             parse_mode="Markdown",
-    #             reply_markup=InlineKeyboardMarkup([
-    #                 [InlineKeyboardButton("▶️ Начать 3 вопроса", callback_data="qa_begin")]
-    #             ])
-    #         )
-    #     except Exception:
-    #         await msg.reply_text(
-    #             text2,
-    #             parse_mode="Markdown",
-    #             reply_markup=InlineKeyboardMarkup([
-    #                 [InlineKeyboardButton("▶️ Начать 3 вопроса", callback_data="qa_begin")]
-    #             ])
-    #         )
-    #     st["step"] = "await_qa_begin"
-        return
-
 async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _reg_active(context):
         return
@@ -1148,33 +1035,32 @@ async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if st["step"] == "q1":
             answers["q1"] = text
             st["step"] = "q2"
-            await msg.reply_text(_reg_questions()[1])
+            await msg.reply_text(_reg_questions()[1].format(name=st.get("name","друг")))
             return
 
         if st["step"] == "q2":
             answers["q2"] = text
             st["step"] = "q3"
-            await msg.reply_text(_reg_questions()[2])
+            await msg.reply_text(_reg_questions()[2].format(name=st.get("name","друг")))
             return
 
         if st["step"] == "q3":
             answers["q3"] = text
             # Подстрахуемся: вытащим возможную сумму из ответа; GPT позже может её переопределить.
             st["deposit"] = _parse_deposit_from_text(text)
-            # Перед расписанием спросим план тренировки (ссылка или текст)
-            st["step"] = "q_plan"
-            await msg.reply_text(
-                "📹 Опиши тренировку:\n"
-                "— напиши текст (что делаешь),\n"
-                "— или пришли ССЫЛКУ на видео (YouTube/VK и т.п.).\n\n"
-                "Примеры:\n"
-                "• \"Разминка 5 мин, 3×10 отжиманий, 3×15 приседаний...\"\n"
-                "• https://youtu.be/XXXXX",
-            )
-            return
+            # Показываем экран «Твоя картина» с картинкой 03_lightning и кнопкой перехода к расписанию
+            st["step"] = "await_days_start"
+            await _send_local_photo_or_text(context.bot, msg.chat_id, ASSET_IMG_3, ONBOARDING_TEXT_3,
+                                            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("✅ Зафиксировать расписание", callback_data="days_start")]]))
 
-    # ───────────────── ПЛАН ТРЕНИРОВКИ (текст/ссылка) ─────────────────
+        return
+
+
+
+     # ───────────────── ПЛАН ТРЕНИРОВКИ (текст/ссылка) ─────────────────
     if st.get("step") == "q_plan":
+         # общий план можно оставить, но основной сценарий — по дням
         url_m = re.search(r'(https?://\S+)', text)
         if url_m:
             st["workout_video_url"] = url_m.group(1).strip()
@@ -1182,34 +1068,69 @@ async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             st["workout_text"] = text.strip()[:2000] if text.strip() else None
             st["workout_video_url"] = None
-
-        # Переходим к выбору дней (тумблеры)
         st["step"] = "pick_days"
         st["chosen_days"] = []
-        await msg.reply_text(
-            "🗓 Выбери дни тренировок (нажимай, чтобы включать/выключать). Потом — «Готово ▶️».",
-            reply_markup=_days_toggle_kb(st)
-        )
+        await msg.reply_text("🗓 Выбери дни тренировок (нажимай, чтобы включать/выключать). Потом — «✅ Готово».",
+                              reply_markup=_days_toggle_kb(st))
         return
+
+# -------- По-дневный план: ввод текста/ссылок, затем «ещё/готово»
+    if st.get("step") == "plan_day" and st.get("temp_day_en"):
+        day = st["temp_day_en"]
+        txt = text.strip()
+        urls = re.findall(r'(https?://\S+)', txt)
+        text_only = txt
+
+        for u in urls:
+            text_only = text_only.replace(u, "").strip()
+        entry = {"text": (text_only[:2000] or None), "videos": [u.strip() for u in urls[:10]]}
+        st.setdefault("per_day_plan", {}).setdefault(day, []).append(entry)
+        st["step"] = "plan_day_more"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Добавить ещё", callback_data=f"plan_add:{day}")],
+                                   [InlineKeyboardButton("✅ Готово", callback_data=f"plan_done:{day}")]])
+        await msg.reply_text(
+            "⚡️ Хочешь добавить ещё одну программу в эту тренировку?\n\n⚔️ Главное — рассчитай силы. Пощады не будет.",
+            reply_markup=kb)
+
+        return
+
+    if st.get("step") == "dur_for_that_day" and st.get("temp_day_en"):
+        m = _parse_duration_minutes(text)
+        if m is None:
+            await msg.reply_text("❌ Неверный формат.\nНапиши время в минутах (например, 239)")
+            return
+        day = st["temp_day_en"]
+        st.setdefault("per_day_duration_map", {})[day] = int(m)
+        await _show_day_confirm(msg, st, day)
+        st["step"] = "confirm_day"
+        return
+
+    # ───────────────── Ручной ввод времени для дня ─────────────────
 
     # ───────────────── Ручной ввод времени для дня ─────────────────
     if st.get("temp_day_en") and st.get("step") in ("enter_time_for_day", "times_loop"):
         t = _parse_time_hhmm(text.replace(" ", "").replace(".", ":"))
         if not t:
-            await msg.reply_text("Формат времени ЧЧ:ММ, напр. 18:00. Попробуй ещё раз.")
+            await msg.reply_text("❌ Неверный формат.\nНапиши время в формате ЧЧ:ММ (например, 02:39).")
             return
+
         day_en = st.pop("temp_day_en")
-        st["schedule_map_time"][day_en] = t.strftime("%H:%M")
+        st.setdefault("schedule_map_time", {})[day_en] = t.strftime("%H:%M")
+
+        # остались дни — спрашиваем следующее время
         pend = st.get("pending_days_time", [])
         if pend:
             next_day = pend.pop(0)
             st["temp_day_en"] = next_day
+            st["step"] = "enter_time_for_day"
             ru = RU_FULL_BY_EN.get(next_day, next_day)
             await msg.reply_text(
-                f"⏰ Время для {ru}:",
-                reply_markup=_time_kb_for_day(next_day, st["schedule_map_time"].get(next_day))
+                f"📅 {ru}\n\n⏰ Выбери время тренировки или напиши точное время (например, 02:39).",
+                reply_markup=_time_kb_for_day(next_day)
             )
             return
+
+        # все дни получили время → дальше к отдыху/длительности
         st["step"] = "ask_rest_inline"
         await msg.reply_text("⏱️ Выбери отдых между подходами:", reply_markup=_rest_inline_kb())
         return
@@ -1217,7 +1138,7 @@ async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ───────────────── Ручной ввод отдыха ─────────────────
     if st.get("step") == "ask_rest":
         rest_sec = _parse_rest_seconds(text)
-        if rest_sec is None or rest_sec > 24*60*60:
+        if rest_sec is None or rest_sec > 24 * 60 * 60:
             await msg.reply_text("Введи секунды или ММ:СС. Пример: 60 или 1:30.")
             return
         st["rest_seconds"] = rest_sec
@@ -1257,10 +1178,7 @@ async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(save_text)
 
         context.user_data.pop("reg", None)
-        await msg.reply_text(
-            "Готово! Ниже — главное меню.",
-            reply_markup=_make_keyboard(False, update.effective_user.id)
-        )
+        await msg.reply_text("Готово! Ниже — главное меню.", reply_markup=_make_keyboard(False, update.effective_user.id))
         return
 
     # ───────────────── «⌨️ Другое (ввести)» — ОБЩАЯ длительность ─────────────────
@@ -1294,21 +1212,33 @@ async def register_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             any_dur = next(iter(st.get("schedule_map_duration", {}).values()))
         except Exception:
             any_dur = 60
-        _set_window_seconds_cached(update.effective_user.id, int(any_dur)*60)
+        _set_window_seconds_cached(update.effective_user.id, int(any_dur) * 60)
         # ⬇️ ИИ-рекомендация залога
         await _auto_deposit_and_finish(msg, update, context, st)
         return
 
     # ───────────────── Фолбэк: просим пользоваться инлайн-кнопками ─────────────────
     if st.get("step") in ("pick_day", "pick_day_or_done", "pick_days"):
-        await msg.reply_text(
-            "Выбирай дни кнопками ниже и жми «Готово ▶️».",
-            reply_markup=_days_toggle_kb(st)
-        )
+        await msg.reply_text("Выбирай дни кнопками ниже и жми «Готово ▶️».", reply_markup=_days_toggle_kb(st))
+
+
+def _webapp_base() -> str:
+    base = (getattr(settings, "WEBAPP_URL", None) or getattr(settings, "PUBLIC_BASE_URL", "")).strip()
+    base = base.rstrip("/")
+    if base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+    if not base.startswith("https://"):
+        base = "https://" + base
+    return base
+
+
+def _build_webapp_url(params: dict) -> str:
+    return _webapp_base() + "/?" + urlencode(params, safe=":/?&=,+@")
 
 
 # ---------------- Сохранение настроек онбординга ----------------
-async def _persist_onboarding_schedule_per_day(user_id: int, context: ContextTypes.DEFAULT_TYPE, st: dict) -> Optional[str]:
+async def _persist_onboarding_schedule_per_day(user_id: int, context: ContextTypes.DEFAULT_TYPE, st: dict) -> Optional[
+    str]:
     per_day_time: Dict[str, str] = st.get("schedule_map_time") or {}
     if not per_day_time:
         return None
@@ -1317,8 +1247,14 @@ async def _persist_onboarding_schedule_per_day(user_id: int, context: ContextTyp
 
     dur_mode = st.get("dur_mode")  # "same" | "per_day"
     per_day_duration: Dict[str, int] = {}
+    per_day_plan = st.get("per_day_plan") or {}
+    per_day_duration_map = st.get("per_day_duration_map") or {}
 
-    if dur_mode == "per_day":
+    if per_day_duration_map:
+        per_day_duration = {d: int(per_day_duration_map.get(d) or 60) for d in per_day_time.keys()}
+        default_duration = 60
+        workout_duration_common = None
+    elif dur_mode == "per_day":
         raw = st.get("schedule_map_duration") or {}
         per_day_duration = {d: int(raw.get(d) or 60) for d in per_day_time.keys()}
         default_duration = 60
@@ -1348,27 +1284,19 @@ async def _persist_onboarding_schedule_per_day(user_id: int, context: ContextTyp
 
     reminder_days = list(per_day_time.keys())
 
-    extras = {
-        "answers": st.get("answers") or {},             # новые ответы (3 вопроса)
-        "deposit": st.get("deposit"),
-        "deposit_days": st.get("deposit_days"),
-        "deposit_started_at": st.get("deposit_started_at"),
-        "deposit_done_dates": st.get("deposit_done_dates", []),
-        "reg_photos": list(st.get("photos") or []),     # сохраняем 2 фото регистрации
-        "workout_text": st.get("workout_text"),
-        "workout_video_url": st.get("workout_video_url"),
-    }
+    extras = {"answers": st.get("answers") or {},  # новые ответы (3 вопроса)
+              "deposit": st.get("deposit"), "deposit_days": st.get("deposit_days"),
+              "deposit_started_at": st.get("deposit_started_at"),
+              "deposit_done_dates": st.get("deposit_done_dates", []), "reg_photos": list(st.get("photos") or []),
+              # сохраняем 2 фото регистрации
+              "workout_text": st.get("workout_text"), "workout_video_url": st.get("workout_video_url"), }
 
-    training_form = {
-        "per_day_time": per_day_time,
-        "per_day_duration": per_day_duration,
-        **extras,
-    }
+    training_form = {"per_day_time": per_day_time, "per_day_duration": per_day_duration, "per_day_plan": per_day_plan,
+                     **extras, }
     training_form_json = json.dumps(training_form, ensure_ascii=False)
 
     async with Database.acquire() as conn:
-        await conn.execute(
-            """
+        await conn.execute("""
             UPDATE users
                SET reminder_enabled = TRUE,
                    reminder_days = $2,
@@ -1377,61 +1305,66 @@ async def _persist_onboarding_schedule_per_day(user_id: int, context: ContextTyp
                    rest_seconds = $5,
                    training_form = $6
              WHERE user_id = $1
-            """,
-            user_id,
-            reminder_days,
-            rtime,
-            workout_duration_common,   # None если разная длительность
-            rest_seconds,
-            training_form_json
-        )
+            """, user_id, reminder_days, rtime, workout_duration_common,  # None если разная длительность
+                           rest_seconds, training_form_json)
 
-    _schedule_reminders_per_day(
-        context, user_id,
-        per_day_time,
-        per_day_duration,
-        default_duration_min=(workout_duration_common or 60)
-    )
+    _schedule_reminders_per_day(context, user_id, per_day_time, per_day_duration,
+                                default_duration_min=(workout_duration_common or 60))
     _set_registered(user_id, True)
     lines = _human_schedule_lines(per_day_time, per_day_duration)
     txt = "✅ Напоминания включены.\n" + "\n".join(lines) + f"\nОтдых: {rest_seconds} сек."
     return txt
+
 
 def _reg_schedule_text_lines(st: dict) -> str:
     per_day_time: Dict[str, str] = st.get("schedule_map_time") or {}
     lines = _human_schedule_lines(per_day_time)
     return "\n".join(lines) if lines else "— (пока не указал)"
 
+
 async def _reg_finish(msg: Message, st: dict):
     name = st.get("name") or "друг"
-    dep = st.get("deposit", 500)
+    dep = max(5000, int(st.get("deposit", 5000)))
     deposit_days = int(st.get("deposit_days") or 7)
     schedule = _reg_schedule_text_lines(st)
     rest_seconds = int(st.get("rest_seconds") or 60)
-    await msg.reply_text(
-        f"🚀 Отлично, {name}! Мы замораживаем {dep} ₽ на {deposit_days} дн.\n\n"
-        "Если выполнишь все тренировки — деньги полностью вернутся ✅\n\n"
-        "Если пропустишь — потеряешь деньги\n"
-        f"Твоё расписание:\n{schedule}\n"
-        f"Отдых между подходами: {rest_seconds} сек."
-    )
+    await msg.reply_text("🏁 name, регистрация завершена!\n"
+                         "Добро пожаловать на путь без права отступать.\n\n"
+                         "📖 Разбор твоей ситуации:\n"
+                         "Ты на старте пути — полон эмоций, но именно они чаще всего ломают.\n"
+                         "Мы учли твои ответы, расписание и подход к тренировкам.\n\n"
+                         f"💰 Рекомендуемый залог: {dep} ₽\n"
+                         "Это сумма, которая не даст тебе сорваться: достаточно весомая, чтобы держать тебя в игре,\n"
+                         "но не рвёт бюджет. Дальше — только действия.\n\n"
+                         "👇 Внеси залог и покажи, что слова — не пустой звук.")
+
 
 # ---------------- Инлайн-колбэки регистрации ----------------
 async def register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user  # ✅ тут он уже есть
+    name = f"@{user.username}" if user.username else (user.first_name or "name")
     if not _reg_active(context):
         await update.callback_query.answer()
         return
 
     cq = update.callback_query
     data = cq.data or ""
+    await _safe_cq_answer(cq)
     st = _reg_state(context)
-    if not st and data in ("ob_next", "qa_begin"):
+    if data in ("ob_next", "qa_begin") and not st:
         user = update.effective_user
         st["name"] = user.first_name or (user.username and f"@{user.username}") or "друг"
         st["step"] = "await_qa_begin"
         st["answers"] = {}
         st["schedule_map_time"] = {}
         st["schedule_map_duration"] = {}
+    else:
+        # Для глубоких колбэков честно говорим перезапустить
+        try:
+            await cq.answer("Сессия регистрации была сброшена. Нажми /start, чтобы начать заново.", show_alert=True)
+        except Exception:
+            pass
+        return
 
     # Если это вообще не наш онбординг — вежливо отвечаем и выходим
     if not _reg_active(context) and data not in ("ob_next", "qa_begin"):
@@ -1456,12 +1389,21 @@ async def register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text2 = ONBOARDING_TEXT_2.format(name=st.get("name", "друг"))
         kb2 = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать 3 вопроса", callback_data="qa_begin")]])
-        await _send_local_photo_or_text(
-            context.bot, cq.message.chat_id, ASSET_IMG_2, text2,
-            parse_mode="Markdown", reply_markup=kb2
-        )
+        await _send_local_photo_or_text(context.bot, cq.message.chat_id, ASSET_IMG_2, text2, parse_mode="Markdown",
+                                        reply_markup=kb2)
         await _safe_cq_answer(cq)
         return
+
+    if data == "days_start":
+        st["step"] = "pick_days"
+        st["chosen_days"] = []
+        await cq.message.reply_text(
+            "🚀 Формируем твой боевой график.\nКаждый день — обещание самому себе.\n\n"
+            "Выбирай дни тренировок (нажимай, чтобы включать/выключать). Затем — «✅ Готово».",
+            reply_markup=_days_toggle_kb(st))
+        await _safe_cq_answer(cq)
+        return
+
 
     # ====== Выбор дней (тумблеры) ======
     if data.startswith("days_toggle:"):
@@ -1489,14 +1431,12 @@ async def register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         st["schedule_map_time"] = {}
         st["pending_days_time"] = chosen.copy()
-        st["step"] = "times_loop"
+        st["step"] = "enter_time_for_day"
         next_day = st["pending_days_time"].pop(0)
         st["temp_day_en"] = next_day
         ru = RU_FULL_BY_EN.get(next_day, next_day)
-        await cq.message.reply_text(
-            f"⏰ Время для {ru}:",
-            reply_markup=_time_kb_for_day(next_day)
-        )
+        await cq.message.reply_text(f"📅 {ru}\n\n⏰ Выбери время тренировки или напиши точное время (например, 02:39).",
+                                    reply_markup=_time_kb_for_day(next_day))
         await _safe_cq_answer(cq)
         return
 
@@ -1504,31 +1444,29 @@ async def register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("time_pick:"):
         parts = data.split(":", 2)
         if len(parts) < 3:
-            await _safe_cq_answer("Некорректные данные времени", show_alert=True)
+            await _safe_cq_answer(cq, "Некорректные данные времени", show_alert=True)
             return
         _, day_en, hhmm = parts
         st.setdefault("schedule_map_time", {})[day_en] = hhmm
+
+        # идём к следующему дню, если остались
         pend = st.get("pending_days_time", [])
         if pend:
-            nd = pend.pop(0)
-            st["temp_day_en"] = nd
-            ru = RU_FULL_BY_EN.get(nd, nd)
-            await cq.message.reply_text(f"⏰ Время для {ru}:", reply_markup=_time_kb_for_day(nd))
+            next_day = pend.pop(0)
+            st["temp_day_en"] = next_day
+            st["step"] = "enter_time_for_day"
+            ru = RU_FULL_BY_EN.get(next_day, next_day)
+            await cq.message.reply_text(
+                f"📅 {ru}\n\n⏰ Выбери время тренировки или напиши точное время (например, 02:39).",
+                reply_markup=_time_kb_for_day(next_day)
+            )
             await _safe_cq_answer(cq, f"{EN2RU_SHORT.get(day_en, day_en)} — {hhmm}")
             return
-        st.pop("temp_day_en", None)
+
+        # все дни получили время → дальше к отдыху/длительности
         st["step"] = "ask_rest_inline"
         await cq.message.reply_text("⏱️ Выбери отдых между подходами:", reply_markup=_rest_inline_kb())
         await _safe_cq_answer(cq, f"{EN2RU_SHORT.get(day_en, day_en)} — {hhmm}")
-        return
-
-    if data.startswith("time_custom:"):
-        _, day_en = data.split(":")
-        st["temp_day_en"] = day_en
-        st["step"] = "enter_time_for_day"
-        ru = RU_FULL_BY_EN.get(day_en, day_en)
-        await cq.message.reply_text(f"Введи время для {ru} в формате ЧЧ:ММ")
-        await _safe_cq_answer(cq)
         return
 
     # ====== Отдых ======
@@ -1536,7 +1474,8 @@ async def register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest_sec = int(data.split(":", 1)[1])
         st["rest_seconds"] = rest_sec
         st["step"] = "ask_duration_mode"
-        await cq.message.reply_text("⏲️ Длительность одинаковая или разная по дням?", reply_markup=_dur_mode_inline_kb_pretty())
+        await cq.message.reply_text("⏲️ Длительность одинаковая или разная по дням?",
+                                    reply_markup=_dur_mode_inline_kb_pretty())
         await _safe_cq_answer(cq, f"Отдых: {rest_sec} сек")
         return
 
@@ -1552,20 +1491,10 @@ async def register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["dur_mode"] = "same"
             st["duration_common_min"] = int(st.get("duration_common_min") or 60)
             st["step"] = "ask_duration_common_inline"
-            await cq.message.reply_text(
-                "⏲️ Минуты на все дни:",
-                reply_markup=_dur_common_kb(st["duration_common_min"])
-            )
+            await cq.message.reply_text("⏲️ Минуты на все дни:", reply_markup=_dur_common_kb(st["duration_common_min"]))
         else:
             st["dur_mode"] = "per_day"
-            per_day_time: Dict[str, str] = st.get("schedule_map_time") or {}
-            pending = [d for d in ORDERED_DAYS if d in per_day_time]
-            st["pending_days_dur"] = pending
-            st["step"] = "ask_duration_for_day_inline"
-            first = pending.pop(0)
-            st["temp_day_en"] = first
-            ru = RU_FULL_BY_EN.get(first, first)
-            await cq.message.reply_text(f"⏲️ Минуты для {ru}:", reply_markup=_dur_perday_kb(first, 60))
+            await cq.message.reply_text("Окей, длительность зададим на этапе каждого дня после плана.")
         await _safe_cq_answer(cq)
         return
 
@@ -1604,27 +1533,64 @@ async def register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ====== Длительность по дням ======
     if data.startswith("dur_pd_set:"):
-        _, day_en, v = data.split(":")
-        st.setdefault("schedule_map_duration", {})[day_en] = int(v)
-        pend = st.get("pending_days_dur", [])
+        _, day, v = data.split(":")
+        st.setdefault("per_day_duration_map", {})[day] = int(v)
+        await _show_day_confirm(cq.message, st, day)
+        st["step"] = "confirm_day"
+        await _safe_cq_answer(cq, f"{EN2RU_SHORT.get(day, day)} — {v} мин")
+        return
+
+    if data.startswith("plan_add:"):
+        _, day = data.split(":")
+        st["step"] = "plan_day"
+        st["temp_day_en"] = day
+        await cq.message.reply_text("Окей, добавь ещё блок: текст и/или ссылки.")
+        return
+
+    if data.startswith("plan_done:"):
+        _, day = data.split(":")
+        st["step"] = "dur_for_that_day"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("20 мин", callback_data=f"dur_pd_set:{day}:20"),
+                                    InlineKeyboardButton("30 мин", callback_data=f"dur_pd_set:{day}:30"),
+                                    InlineKeyboardButton("40 мин", callback_data=f"dur_pd_set:{day}:40")],
+                                   [InlineKeyboardButton("50 мин", callback_data=f"dur_pd_set:{day}:50"),
+                                    InlineKeyboardButton("60 мин", callback_data=f"dur_pd_set:{day}:60"),
+                                    InlineKeyboardButton("90 мин", callback_data=f"dur_pd_set:{day}:90")], ])
+        await cq.message.reply_text(
+            "⏳ Выбери время, за которое ты выполнишь эту тренировку.\nИли напиши количество минут (например, 239).",
+            reply_markup=kb)
+        return
+
+    if data.startswith("day_edit:"):
+        _, day = data.split(":")
+        (st.get("schedule_map_time") or {}).pop(day, None)
+        (st.get("per_day_duration_map") or {}).pop(day, None)
+        (st.get("per_day_plan") or {}).pop(day, None)
+        pend = st.get("pending_days_time", [])
+        st["pending_days_time"] = [day] + pend
+        st["temp_day_en"] = day
+        st["step"] = "enter_time_for_day"
+        ru = RU_FULL_BY_EN.get(day, day)
+        await cq.message.reply_text(f"📅 {ru}\n\n⏰ Выбери время тренировки или напиши точное время (например, 02:39).",
+                                    reply_markup=_time_kb_for_day(day))
+        return
+
+    if data.startswith("day_ok:"):
+        _, day = data.split(":")
+        pend = st.get("pending_days_time", [])
         if pend:
             next_day = pend.pop(0)
             st["temp_day_en"] = next_day
+            st["step"] = "enter_time_for_day"
             ru = RU_FULL_BY_EN.get(next_day, next_day)
-            await cq.message.reply_text(f"⏲️ Минуты для {ru}:", reply_markup=_dur_perday_kb(next_day, 60))
-            await _safe_cq_answer(cq, f"{EN2RU_SHORT.get(day_en, day_en)} — {v} мин")
+            await cq.message.reply_text(
+                f"📅 {ru}\n\n⏰ Выбери время тренировки или напиши точное время (например, 02:39).",
+                reply_markup=_time_kb_for_day(next_day))
             return
-
-        # это был последний день → запускаем ИИ-рекомендацию залога
-        try:
-            any_dur = next(iter(st.get("schedule_map_duration", {}).values()))
-        except Exception:
-            any_dur = 60
-        _set_window_seconds_cached(update.effective_user.id, int(any_dur) * 60)
-        await _auto_deposit_and_finish(cq.message, update, context, st)
-        await _safe_cq_answer(cq, f"{EN2RU_SHORT.get(day_en, day_en)} — {v} мин")
+        # все дни оформлены → дальше как раньше: отдых → длительности режим уже выбран
+        st["step"] = "ask_rest_inline"
+        await cq.message.reply_text("⏱️ Выбери отдых между подходами:", reply_markup=_rest_inline_kb())
         return
-
     if data.startswith("dur_pd_custom:"):
         _, day_en = data.split(":")
         st["temp_day_en"] = day_en
@@ -1654,13 +1620,36 @@ async def register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await register_start(update, context)
 
+
+async def _show_day_confirm(message: Message, st: dict, day: str):
+    ru = RU_FULL_BY_EN.get(day, day)
+    t = (st.get("schedule_map_time") or {}).get(day)
+    dur = (st.get("per_day_duration_map") or {}).get(day)
+    plans = (st.get("per_day_plan") or {}).get(day, [])
+    lines = []
+    for p in plans:
+        if p.get("text"):
+            lines.append(f"• {p['text']}")
+        for u in p.get("videos") or []:
+            lines.append(f"• Ссылка: {u}")
+    plan_block = "\n".join(lines) if lines else "—"
+    text = (f"🔥 name, проверим твой план!\n\n"
+            f"📅 {ru}\n"
+            f"⏰ Начало: {t or '—'}\n"
+            f"⏳ Длительность: {dur or '—'} мин\n"
+            f"💪 Программа:\n{plan_block}\n\n"
+            "⚔️ Всё верно? Скоро не будет пути назад.")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Редактировать", callback_data=f"day_edit:{day}")],
+                               [InlineKeyboardButton("✅ Всё верно", callback_data=f"day_ok:{day}")]])
+    await message.reply_text(text, reply_markup=kb)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
-        await (update.effective_message or message).reply_text(
-            "Не понял. Нажми кнопку ниже.",
-            reply_markup=_current_keyboard(context, update.effective_user.id)
-        )
+        await (update.effective_message or message).reply_text("Не понял. Нажми кнопку ниже.",
+                                                               reply_markup=_current_keyboard(context,
+                                                                                              update.effective_user.id))
         return
 
     msg = message.text.strip()
@@ -1670,10 +1659,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Запуск регистрации из меню
     if low in ("📝 регистрация", "регистрация", "/register"):
         if await _already_registered(user.id):
-            await message.reply_text(
-                "Ты уже зарегистрирован ✅\n",
-                reply_markup=_make_keyboard(False, user.id)
-            )
+            await message.reply_text("Ты уже зарегистрирован ✅\n", reply_markup=_make_keyboard(False, user.id))
             return
         await register_start(update, context)
         return
@@ -1690,8 +1676,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _ws_get(context, user.id)
             await message.reply_text(
                 "🚀 Режим тренировки включён (админ). Жми «▶️ Начать тренировку». Будет 3 снимка с паузами отдыха.",
-                reply_markup = await _build_workout_keyboard(context, user.id)
-            )
+                reply_markup=await _build_workout_keyboard(context, user.id))
             return
         if low in ("🔴 стоп тренировки (админ)", "стоп тренировки", "🔴 стоп тренировки", "/end_workout"):
             _set_session_active(context, user.id, False)
@@ -1742,10 +1727,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tf["deposit_left"] = int(st["amount"])
 
                 async with Database.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE users SET training_form = $2 WHERE user_id = $1",
-                        user.id, json.dumps(tf, ensure_ascii=False)
-                    )
+                    await conn.execute("UPDATE users SET training_form = $2 WHERE user_id = $1", user.id,
+                                       json.dumps(tf, ensure_ascii=False))
 
                 await message.reply_text(f"✅ Залог обновлён: {tf['deposit']} ₽ на {days} дн.")
             except Exception as e:
@@ -1760,67 +1743,51 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = _parse_days(msg)
         if not days:
             async with Database.acquire() as conn:
-                await conn.execute(
-                    """
+                await conn.execute("""
                     UPDATE users
                        SET reminder_enabled = FALSE,
                            reminder_days = $2,
                            reminder_time = NULL,
                            workout_duration = NULL
                      WHERE user_id = $1
-                    """,
-                    user.id, days
-                )
+                    """, user.id, days)
             await _reschedule_from_db(update, context, user.id)
             _set_session_active(context, user.id, False)
             context.user_data.clear()
-            await message.reply_text(
-                "🔕 Напоминания отключены. Когда начнёшь — просто тренируйся.",
-                reply_markup=_make_keyboard(False, user.id)
-            )
+            await message.reply_text("🔕 Напоминания отключены. Когда начнёшь — просто тренируйся.",
+                                     reply_markup=_make_keyboard(False, user.id))
             return
 
         context.user_data["reminder_days"] = days
         context.user_data.pop("awaiting_reminder_days", None)
         context.user_data["awaiting_reminder_time"] = True
-        await message.reply_text(
-            "⏰ Во сколько напоминать? Например 07:00, 19:30 или нажми кнопку.",
-            reply_markup=time_keyboard()
-        )
+        await message.reply_text("⏰ Во сколько напоминать? Например 07:00, 19:30 или нажми кнопку.",
+                                 reply_markup=time_keyboard())
         return
 
     if context.user_data.get("awaiting_reminder_time"):
         if low == "другое время":
-            await message.reply_text(
-                "Введи время в формате ЧЧ:ММ, например 19:30.",
-                reply_markup=time_keyboard()
-            )
+            await message.reply_text("Введи время в формате ЧЧ:ММ, например 19:30.", reply_markup=time_keyboard())
             return
 
         t = _parse_time_hhmm(msg)
         if not t:
-            await message.reply_text(
-                "Не понял время. Введи в формате ЧЧ:ММ (например, 08:00).",
-                reply_markup=time_keyboard()
-            )
+            await message.reply_text("Не понял время. Введи в формате ЧЧ:ММ (например, 08:00).",
+                                     reply_markup=time_keyboard())
             return
         context.user_data["reminder_time"] = t
         context.user_data.pop("awaiting_reminder_time", None)
 
         context.user_data["awaiting_reminder_duration"] = True
-        await message.reply_text(
-            "⏱️ Введи длительность тренировки в минутах (5–240) или выбери кнопку.",
-            reply_markup=duration_keyboard()
-        )
+        await message.reply_text("⏱️ Введи длительность тренировки в минутах (5–240) или выбери кнопку.",
+                                 reply_markup=duration_keyboard())
         return
 
     if context.user_data.get("awaiting_reminder_duration"):
         dur = _parse_duration_minutes(msg)
         if dur is None:
-            await message.reply_text(
-                "Введи число минут (от 5 до 240), например: 30, 60, 95.",
-                reply_markup=duration_keyboard()
-            )
+            await message.reply_text("Введи число минут (от 5 до 240), например: 30, 60, 95.",
+                                     reply_markup=duration_keyboard())
             return
 
         context.user_data["workout_duration"] = dur
@@ -1830,17 +1797,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t = context.user_data.get("reminder_time")
 
         async with Database.acquire() as conn:
-            await conn.execute(
-                """
+            await conn.execute("""
                 UPDATE users
                    SET reminder_enabled = TRUE,
                        reminder_days = $2,
                        reminder_time = $3,
                        workout_duration = $4
                  WHERE user_id = $1
-                """,
-                user.id, days, t, dur
-            )
+                """, user.id, days, t, dur)
 
         per_day_time = {d: t.strftime("%H:%M") for d in days if isinstance(t, time)}
         per_day_duration = {d: dur for d in days}
@@ -1850,13 +1814,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
 
         pretty = " ".join(RU_BY_EN.get(d, d) for d in days)
-        await message.reply_text(
-            f"✅ Напоминания включены.\n"
-            f"Дни: {pretty}\n"
-            f"Время: {t.strftime('%H:%M')}\n"
-            f"Длительность: {dur} мин.",
-            reply_markup=_make_keyboard(False, user.id)
-        )
+        await message.reply_text(f"✅ Напоминания включены.\n"
+                                 f"Дни: {pretty}\n"
+                                 f"Время: {t.strftime('%H:%M')}\n"
+                                 f"Длительность: {dur} мин.", reply_markup=_make_keyboard(False, user.id))
         return
 
     # Изменение залога — шаг 1/2 (через профиль)
@@ -1888,8 +1849,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         restart_window=True)
             await message.reply_text(
                 f"✅ Обновлено: залог {amount} ₽ на {days} дн. Новое окно запущено с сегодняшнего дня.",
-                reply_markup=_current_keyboard(context, update.effective_user.id)
-            )
+                reply_markup=_current_keyboard(context, update.effective_user.id))
         except Exception as e:
             logger.exception("update dep failed: %s", e)
             await message.reply_text("⚠️ Не получилось сохранить изменения. Попробуй ещё раз.")
@@ -1899,18 +1859,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await profile(update, context)
         return
 
-    await message.reply_text("Не понял. Нажми кнопку ниже.",
-                             reply_markup=_current_keyboard(context, user.id))
+    await message.reply_text("Не понял. Нажми кнопку ниже.", reply_markup=_current_keyboard(context, user.id))
+
 
 async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
     context.user_data.clear()
     context.user_data["awaiting_reminder_days"] = True
-    await message.reply_text(
-        "🗓️ Обновим расписание. В какие дни тренируешься?\n"
-        "• «пн ср пт»  • «вт чт сб»  • «пн-пт»  • «каждый день»  • «сб вс»  • «без расписания»",
-        reply_markup=days_keyboard(),
-    )
+    await message.reply_text("🗓️ Обновим расписание. В какие дни тренируешься?\n"
+                             "• «пн ср пт»  • «вт чт сб»  • «пн-пт»  • «каждый день»  • «сб вс»  • «без расписания»",
+                             reply_markup=days_keyboard(), )
+
 
 # ---------------- Приём данных из WebApp (фиксы дубликатов) ----------------
 async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1939,10 +1898,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         async with Database.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET timezone = $2 WHERE user_id = $1",
-                user.id, tz_name
-            )
+            await conn.execute("UPDATE users SET timezone = $2 WHERE user_id = $1", user.id, tz_name)
         _set_tz_for(user.id, tz_name)
 
         await _reschedule_from_db(update, context, user.id)
@@ -2005,8 +1961,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         data = await r.read()
                         photos_bytes.append(data)
                 except Exception as e:
-                    logger.exception("[webapp] user=%s fail pull %d/%d: %s",
-                                     user.id, idx, len(tokens), e)
+                    logger.exception("[webapp] user=%s fail pull %d/%d: %s", user.id, idx, len(tokens), e)
                     await update.message.reply_text("⚠️ Не удалось получить фото. Попробуй ещё раз.")
                     return
 
@@ -2024,6 +1979,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     logger.info("[webapp] skip payload type=%r", ptype)
 
+
 # ---------------- Фото-проверка тренировки ----------------
 async def _save_training_photo(user_id: int, photo_bytes: bytes, bot, notify: bool = False) -> bool:
     from tempfile import NamedTemporaryFile
@@ -2035,15 +1991,13 @@ async def _save_training_photo(user_id: int, photo_bytes: bytes, bot, notify: bo
         tmp_path = tmp.name
 
     try:
-        check_text = (
-            "Оцени фото как доказательство тренировки ДОМА.\n"
-            "Критерии:\n"
-            "1) На фото человек ВЫПОЛНЯЕТ упражнение (а не позирует/селфи/показывает инвентарь).\n"
-            "2) Фото актуально, не скриншот, без монтажей.\n"
-            "3) ЛОКАЦИЯ: жилое помещение (квартира/комната/дом) или домашний инвентарь; "
-            "НЕ допускается коммерческий зал/публичный фитнес-центр.\n"
-            "Верни строго JSON: {\"success\": bool, \"is_home\": bool, \"reason\": string}."
-        )
+        check_text = ("Оцени фото как доказательство тренировки ДОМА.\n"
+                      "Критерии:\n"
+                      "1) На фото человек ВЫПОЛНЯЕТ упражнение (а не позирует/селфи/показывает инвентарь).\n"
+                      "2) Фото актуально, не скриншот, без монтажей.\n"
+                      "3) ЛОКАЦИЯ: жилое помещение (квартира/комната/дом) или домашний инвентарь; "
+                      "НЕ допускается коммерческий зал/публичный фитнес-центр.\n"
+                      "Верни строго JSON: {\"success\": bool, \"is_home\": bool, \"reason\": string}.")
         gpt = await verify_task_with_gpt(check_text, tmp_path)
         verified = bool(gpt.get("success"))
         is_home = bool(gpt.get("is_home"))
@@ -2054,10 +2008,8 @@ async def _save_training_photo(user_id: int, photo_bytes: bytes, bot, notify: bo
             reason = reason or "Обстановка не похожа на домашнюю"
 
         async with Database.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO sets (user_id, photo, verified, gpt_reason) VALUES ($1, $2, $3, $4)",
-                user_id, photo_bytes, verified, reason
-            )
+            await conn.execute("INSERT INTO sets (user_id, photo, verified, gpt_reason) VALUES ($1, $2, $3, $4)",
+                               user_id, photo_bytes, verified, reason)
 
         if notify:
             if verified:
@@ -2078,6 +2030,7 @@ async def _save_training_photo(user_id: int, photo_bytes: bytes, bot, notify: bo
             Path(tmp_path).unlink(missing_ok=True)
         except Exception:
             pass
+
 
 async def _finalize_workout(context: ContextTypes.DEFAULT_TYPE, user_id: int, results: List[bool]) -> None:
     ws = _ws_get(context, user_id)
@@ -2101,10 +2054,8 @@ async def _finalize_workout(context: ContextTypes.DEFAULT_TYPE, user_id: int, re
         elif verified < expected:
             tail = " (одно фото не прошло, но зачёт есть)"
 
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"🏁 Тренировка: ✅ засчитана — подтверждено {verified}/{expected}{tail}."
-        )
+        await context.bot.send_message(chat_id=user_id,
+                                       text=f"🏁 Тренировка: ✅ засчитана — подтверждено {verified}/{expected}{tail}.")
         _cancel_timers()
 
         try:
@@ -2124,18 +2075,14 @@ async def _finalize_workout(context: ContextTypes.DEFAULT_TYPE, user_id: int, re
                     tf["deposit_done_dates"] = done_dates
 
                 async with Database.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE users SET training_form=$2 WHERE user_id=$1",
-                        user_id, json.dumps(tf, ensure_ascii=False)
-                    )
+                    await conn.execute("UPDATE users SET training_form=$2 WHERE user_id=$1", user_id,
+                                       json.dumps(tf, ensure_ascii=False))
 
                 if len(done_dates) >= deposit_days:
                     try:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text="🎉 Прогресс по заморозке выполнен полностью!\n\nВыбери, что делаем дальше:",
-                            reply_markup=_deposit_complete_kb()
-                        )
+                        await context.bot.send_message(chat_id=user_id,
+                                                       text="🎉 Прогресс по заморозке выполнен полностью!\n\nВыбери, что делаем дальше:",
+                                                       reply_markup=_deposit_complete_kb())
                     except Exception:
                         pass
         except Exception as e:
@@ -2143,14 +2090,9 @@ async def _finalize_workout(context: ContextTypes.DEFAULT_TYPE, user_id: int, re
 
         return
 
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=(
-            "🏁 Тренировка: ❌ не засчитана.\n"
-            f"Получено: {received}/{expected}, подтверждено: {verified}/{expected}.\n"
-            f"Для зачёта нужно ≥ {threshold}."
-        )
-    )
+    await context.bot.send_message(chat_id=user_id, text=("🏁 Тренировка: ❌ не засчитана.\n"
+                                                          f"Получено: {received}/{expected}, подтверждено: {verified}/{expected}.\n"
+                                                          f"Для зачёта нужно ≥ {threshold}."))
 
     await _send_last_photos_with_reasons(context, user_id, limit=expected)
 
@@ -2166,30 +2108,26 @@ async def _finalize_workout(context: ContextTypes.DEFAULT_TYPE, user_id: int, re
     await _forfeit_deposit(context, user_id, f"недостаточно подтверждённых фото ({verified}/{expected})")
     _cancel_timers()
 
+
 async def _send_last_photos_with_reasons(context: ContextTypes.DEFAULT_TYPE, user_id: int, limit: int = 3) -> None:
     try:
         async with Database.acquire() as conn:
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT photo, verified, COALESCE(gpt_reason,'') AS gpt_reason, 
                        COALESCE(created_at, NOW()) AS created_at
                   FROM sets
                  WHERE user_id = $1
                  ORDER BY created_at DESC
                  LIMIT $2
-                """,
-                user_id, limit
-            )
+                """, user_id, limit)
     except Exception as e:
         logger.exception("fetch last photos failed: %s", e)
         rows = []
 
     if not rows:
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="❌ Фото этой тренировки не найдены в базе. Если это ошибка — напиши админу."
-            )
+            await context.bot.send_message(chat_id=user_id,
+                                           text="❌ Фото этой тренировки не найдены в базе. Если это ошибка — напиши админу.")
         except Exception:
             pass
         return
@@ -2205,11 +2143,8 @@ async def _send_last_photos_with_reasons(context: ContextTypes.DEFAULT_TYPE, use
     for i, r in enumerate(rows[::-1], start=1):
         b = bytes(r.get("photo") or b"")
         cap = _cap(bool(r.get("verified")), str(r.get("gpt_reason") or ""), i)
-        bio = BytesIO(b)
-        bio.name = f"workout_{i}.jpg"
         try:
-            media.append(InputMediaPhoto(media=InputFile(bio, filename=bio.name),
-                                         caption=cap[:1024]))
+            media.append(InputMediaPhoto(media=b, caption=cap[:1024]))
         except Exception:
             media = []
             break
@@ -2235,6 +2170,7 @@ async def _send_last_photos_with_reasons(context: ContextTypes.DEFAULT_TYPE, use
             except Exception:
                 pass
 
+
 # ---------------- Профиль ----------------
 async def _update_deposit_in_db(user_id: int, deposit: int, deposit_days: int, restart_window: bool = False) -> None:
     async with Database.acquire() as conn:
@@ -2253,165 +2189,197 @@ async def _update_deposit_in_db(user_id: int, deposit: int, deposit_days: int, r
         tf["deposit_left"] = int(deposit)
 
     async with Database.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET training_form=$2 WHERE user_id=$1",
-            user_id, json.dumps(tf, ensure_ascii=False)
-        )
+        await conn.execute("UPDATE users SET training_form=$2 WHERE user_id=$1", user_id,
+                           json.dumps(tf, ensure_ascii=False))
 
-# ---------- PROFILE (drop-in) ----------
+
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def _iso_to_local_str(iso_str: Optional[str], tz: ZoneInfo) -> Optional[str]:
+        if not iso_str:
+            return None
+        try:
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=dt_timezone.utc)
+            return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return html.escape(str(iso_str))
+
+    message = update.message or update.callback_query.message
     user = update.effective_user
-    tz = _tz_for(user.id)
-    now = datetime.now(tz)
 
-    # читаем всё нужное из users
-    async with Database.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT username, first_name, last_name,
-                   reminder_enabled, reminder_days, reminder_time,
-                   workout_duration, rest_seconds, training_form, timezone
-              FROM users
-             WHERE user_id = $1
-        """, user.id)
+    reminder_enabled = False
+    rtime: Optional[time] = None
+    duration_global: Optional[int] = None
+    per_day_time: Dict[str, str] = {}
+    per_day_duration: Dict[str, int] = {}
+    rest_seconds: Optional[int] = None
 
-    if not row:
-        await update.effective_message.reply_text(
-            "Профиль не найден. Пройди быструю регистрацию.",
-            reply_markup=_make_keyboard(False, user.id)
-        )
-        return
+    answers: Dict[str, str] = {}
+    deposit = None
+    deposit_days = None
+    deposit_started_at = None
+    deposit_done_dates: List[str] = []
 
-    # TZ
-    tz_name = row.get("timezone") or getattr(settings, "TIMEZONE", "Europe/Moscow")
-    _set_tz_for(user.id, tz_name)
-    tz = _tz_for(user.id)
+    planned_week = 0
+    completed_week = 0
+    tf: Dict = {}
 
-    # Настройки
-    reminder_enabled = bool(row.get("reminder_enabled"))
-    rest_seconds = int(row.get("rest_seconds") or 60)
+    try:
+        async with Database.acquire() as conn:
+            row_user = await conn.fetchrow("""
+                SELECT username, first_name, last_name,
+                       reminder_enabled, reminder_days, reminder_time,
+                       workout_duration, rest_seconds, training_form, registration_date, timezone
+                  FROM users
+                 WHERE user_id = $1
+                """, user.id)
+            if row_user:
+                tz_name = row_user.get("timezone") or getattr(settings, "TIMEZONE", "Europe/Moscow")
+                _set_tz_for(user.id, tz_name)
 
-    # training_form
-    # training_form (старое/тонкое расписание)
-    tf = _load_training_form(row.get("training_form"))
-    per_day_time: Dict[str, str] = (tf.get("per_day_time") or {})
-    per_day_duration: Optional[Dict[str, int]] = (tf.get("per_day_duration") or None)
+                reminder_enabled = bool(row_user["reminder_enabled"])
+                rtime = row_user["reminder_time"]
+                duration_global = row_user["workout_duration"]
+                rest_seconds = row_user.get("rest_seconds")
+                _set_rest_seconds_cached(user.id, int(rest_seconds or 60))
 
-    # legacy (новые «каждый день 08:00 × 30» из мастера напоминаний)
-    legacy_days = list(row.get("reminder_days") or [])
-    t: Optional[time] = row.get("reminder_time")
-    dur = int(row.get("workout_duration") or 0)
+                tf = _load_training_form(row_user.get("training_form"))
+                per_day_time = tf.get("per_day_time") or {}
+                per_day_duration = tf.get("per_day_duration") or {}
+                answers = tf.get("answers") or {}
 
-    legacy_time = {}
-    legacy_dur = None
-    if legacy_days and isinstance(t, time) and dur:
-        legacy_time = {d: t.strftime("%H:%M") for d in legacy_days}
-        legacy_dur = {d: dur for d in legacy_days}
+                deposit = tf.get("deposit")
+                deposit_days = tf.get("deposit_days")
+                deposit_started_at = tf.get("deposit_started_at")
+                deposit_done_dates = list(tf.get("deposit_done_dates") or [])
 
-    # ✅ Приоритет: если legacy заполнен и по множеству дней отличается от TF — показываем legacy
-    if legacy_time:
-        tf_days = set((per_day_time or {}).keys())
-        legacy_days_set = set(legacy_time.keys())
-        if not per_day_time or (legacy_days_set != tf_days):
-            per_day_time = legacy_time
-            per_day_duration = legacy_dur
+                if per_day_time:
+                    planned_week = len(per_day_time)
+                else:
+                    try:
+                        rdays = row_user.get("reminder_days") or []
+                        planned_week = len([d for d in rdays if d in ORDERED_DAYS])
+                    except Exception:
+                        planned_week = 0
 
-    # Фолбэк на старые поля, если per_day_time ещё пуст
-    if not per_day_time:
-        legacy_days = list(row.get("reminder_days") or [])
-        t: Optional[time] = row.get("reminder_time")
-        dur = int(row.get("workout_duration") or 60)
-        if legacy_days and isinstance(t, time):
-            per_day_time = {d: t.strftime("%H:%M") for d in legacy_days}
-            per_day_duration = {d: dur for d in legacy_days}
-        else:
-            per_day_time = {}
-            per_day_duration = None
+            tz = _tz_for(user.id)
+            dt_to = datetime.now(tz)
+            dt_from = dt_to - timedelta(days=7)
 
-    # Строки «Дни/время/длительность»
-    sched_lines = _human_schedule_lines(per_day_time, per_day_duration)
+            rows_sets = []
+            try:
+                rows_sets = await conn.fetch("""
+                    SELECT created_at, verified
+                      FROM sets
+                     WHERE user_id = $1
+                       AND created_at >= $2
+                    """, user.id, dt_from.astimezone(dt_timezone.utc))
+            except Exception:
+                try:
+                    rows_sets = await conn.fetch("""
+                        SELECT ts AS created_at, verified
+                          FROM sets
+                         WHERE user_id = $1
+                           AND ts >= $2
+                        """, user.id, dt_from.astimezone(dt_timezone.utc))
+                except Exception:
+                    rows_sets = []
 
-    # Анкета
-    answers = tf.get("answers") or {}
-    a1 = str(answers.get("q1", "")).strip()
-    a2 = str(answers.get("q2", "")).strip()
-    a3 = str(answers.get("q3", "")).strip()
+            completed_days = set()
+            for r in rows_sets:
+                if not bool(r.get("verified")):
+                    continue
+                ts = r.get("created_at")
+                if not isinstance(ts, datetime):
+                    continue
+                ts_local = ts.astimezone(tz) if ts.tzinfo else ts.replace(tzinfo=tz)
+                completed_days.add(ts_local.date())
 
-    # Залог
-    dep_line = _format_deposit_status(tf, tz)
-    deposit_days = int(tf.get("deposit_days") or 0)
-    done_dates = list(tf.get("deposit_done_dates") or [])
-    done_cnt = len(done_dates)
-    progress_bar = _progress_bar(done_cnt, deposit_days, width=20)
-    started_at = (tf.get("deposit_started_at") or "").strip()
+            completed_week = len(completed_days)
 
-    # План-текст/видео: короткий индикатор
-    has_plan_text = bool((tf.get("workout_text") or "").strip())
-    has_plan_video = bool((tf.get("workout_video_url") or "").strip())
-    plan_text_flag = "да" if has_plan_text else "—"
-    plan_video_flag = "да" if has_plan_video else "—"
+    except Exception as e:
+        logger.exception("profile() failed: %s", e)
 
-    # Режим тренировки (из вашего флага session_active)
-    session_on = _is_session_active(context, user.id)
-    session_line = "включен" if session_on else "выключен"
+    percent_week = int((completed_week / planned_week) * 100) if planned_week else 0
+    week_bar = _progress_bar(completed_week, planned_week)
 
-    # Заголовок профиля
-    who = f"@{row.get('username')}" if row.get('username') else (user.first_name or str(user.id))
-    dt_str = now.strftime("%Y-%m-%d (%A) %H:%M")
-    header = f"👤 Профиль {who}\n{dt_str} ({tz.key})"
+    now_local = datetime.now(_tz_for(user.id))
+    tz_label = getattr(_tz_for(user.id), "key", str(_tz_for(user.id)))
+    today_line = now_local.strftime(f"%Y-%m-%d (%A) %H:%M")
 
-    # Напоминания
-    bell = "включены" if reminder_enabled and per_day_time else "выключены"
-
-    parts = [
-        header,
-        "",
-        f"🔔 Напоминания: {bell}",
-        "",
-        "Дни/время/длительность",
-    ]
-
-    if sched_lines:
-        parts += [f"• {line}" for line in sched_lines]
+    if per_day_time:
+        sched_lines = _human_schedule_lines(per_day_time, per_day_duration or None)
+        sched_text = "\n".join(sched_lines)
     else:
-        parts.append("• без расписания")
+        sched_text = (f"Время: {rtime.strftime('%H:%M') if rtime else '—'}\n"
+                      f"Длительность: {f'{duration_global} мин.' if duration_global else '—'}")
 
-    parts += [
-        "",
-        f"Отдых: {rest_seconds} сек.",
-        "",
-        "📝 Анкета",
-        f"• 1) Почему начинаешь сейчас? Что важно?\n{(a1 or '—')}",
-        f"• 2) Цель на 4 недели (измеримая)?\n{(a2 or '—')}",
-        f"• 3) Что чаще всего срывает и как обойти?\n{(a3 or '—')}",
-        f"{dep_line}",
-        f"• План (текст): {plan_text_flag}",
-        f"• План (видео): {plan_video_flag}",
-        "",
-        "💰 Прогресс по заморозке",
-        f"{done_cnt}/{deposit_days or 0} ({(0 if deposit_days == 0 else int(done_cnt*100/max(1,deposit_days)))}%)",
-        progress_bar,
-    ]
-    if started_at:
-        parts.append(f"Старт окна: {started_at}")
+    _set_registered(user.id, bool(per_day_time))
+    rest_text = f"{rest_seconds} сек." if rest_seconds is not None else "—"
 
-    parts += [
-        "",
-        f"Режим тренировки: {session_line}",
-    ]
+    # Анкета — красиво вывести 3 ответа
+    qs = _reg_questions()
+    form_bits = []
+    if answers:
+        if "q1" in answers: form_bits.append(f"• {html.escape(qs[0])}\n{_h(answers['q1'])}")
+        if "q2" in answers: form_bits.append(f"• {html.escape(qs[1])}\n{_h(answers['q2'])}")
+        if "q3" in answers: form_bits.append(f"• {html.escape(qs[2])}\n{_h(answers['q3'])}")
+    form_bits.append(_format_deposit_status(tf, _tz_for(user.id)))
 
-    text = "\n".join(parts)
+    wt = (tf.get("workout_text") or "").strip()
+    wv = (tf.get("workout_video_url") or "").strip()
+    if wt:
+        form_bits.append(f"• План (текст): {_h(wt)}")
+    if wv:
+        form_bits.append(f"• План (видео): <a href=\"{_h(wv)}\">ссылка</a>")
 
-    await update.effective_message.reply_text(
-        text,
-        reply_markup=_current_keyboard(context, user.id)
-    )
-# ---------- end PROFILE ----------
+    form_text = "\n".join(form_bits) if form_bits else "—"
+
+    dep_days_total = int(deposit_days or 0)
+    dep_done = len(deposit_done_dates or [])
+    deposit_section = ""
+    try:
+        if dep_days_total > 0 and not bool(tf.get("deposit_forfeit")):
+            percent_dep = int(dep_done * 100 / dep_days_total)
+            started_str = _iso_to_local_str(deposit_started_at, _tz_for(user.id))
+            deposit_section = (f"<b>💰 Прогресс по заморозке</b>\n"
+                               f"{dep_done}/{dep_days_total} ({percent_dep}%)\n"
+                               f"{_progress_bar(dep_done, dep_days_total)}" + (
+                                   f"\nСтарт окна: {html.escape(started_str)}" if started_str else "") + "\n\n")
+    except Exception:
+        deposit_section = ""
+
+    html_text = (f"<b>👤 Профиль @{_h(user.username) if user.username else user.id}</b>\n"
+                 f"{_h(today_line)} ({_h(tz_label)})\n\n"
+                 f"🔔 Напоминания: <b>{'включены' if reminder_enabled else 'выключены'}</b>\n\n"
+                 f"<b>Дни/время/длительность</b>\n{sched_text}\n\n"
+                 f"<b>Отдых</b>: {rest_text}\n\n"
+                 f"<b>📝 Анкета</b>\n{form_text}\n\n"
+                 f"{deposit_section}"
+                 f"Режим тренировки: <b>{'активен' if _is_session_active(context, user.id) else 'выключен'}</b>")
+
+    reply_markup = _current_keyboard(context, user.id)
+    try:
+        if bool(tf.get("deposit_forfeit")):
+            await message.reply_text(html_text, parse_mode="HTML", reply_markup=_deposit_forfeit_kb())
+        elif dep_days_total > 0 and dep_done >= dep_days_total:
+            await message.reply_text(html_text, parse_mode="HTML", reply_markup=_deposit_complete_kb())
+        else:
+            await message.reply_text(html_text, parse_mode="HTML", reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+
+    await message.reply_text(html_text, parse_mode="HTML", reply_markup=reply_markup)
+
 
 # ---------------- Админ-команды ----------------
 async def delete_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_admin(user.id):
-        await update.effective_message.reply_text("🚫 Доступ запрещён.", reply_markup=_current_keyboard(context, user.id))
+        await update.effective_message.reply_text("🚫 Доступ запрещён.",
+                                                  reply_markup=_current_keyboard(context, user.id))
         return
     try:
         await Database.drop()
@@ -2422,12 +2390,15 @@ async def delete_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                   reply_markup=_make_keyboard(False, user.id))
     except Exception as e:
         logger.exception("/delete_db failed: %s", e)
-        await update.effective_message.reply_text("⚠️ Ошибка при удалении БД.", reply_markup=_make_keyboard(False, user.id))
+        await update.effective_message.reply_text("⚠️ Ошибка при удалении БД.",
+                                                  reply_markup=_make_keyboard(False, user.id))
+
 
 async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_admin(user.id):
-        await update.effective_message.reply_text("🚫 Доступ запрещён.", reply_markup=_current_keyboard(context, user.id))
+        await update.effective_message.reply_text("🚫 Доступ запрещён.",
+                                                  reply_markup=_current_keyboard(context, user.id))
         return
     try:
         async with Database.acquire() as conn:
@@ -2440,16 +2411,14 @@ async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             try:
-                await conn.execute(
-                    """
+                await conn.execute("""
                     UPDATE users
                        SET reminder_enabled = FALSE,
                            reminder_days = ARRAY[]::text[],
                            reminder_time = NULL,
                            workout_duration = NULL,
                            training_form = NULL
-                    """
-                )
+                    """)
             except Exception:
                 pass
 
@@ -2460,35 +2429,43 @@ async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                   reply_markup=_make_keyboard(False, user.id))
     except Exception as e:
         logger.exception("/clear_db failed: %s", e)
-        await update.effective_message.reply_text("⚠️ Ошибка при очистке данных.", reply_markup=_make_keyboard(False, user.id))
+        await update.effective_message.reply_text("⚠️ Ошибка при очистке данных.",
+                                                  reply_markup=_make_keyboard(False, user.id))
+
 
 # Дополнительно: команды для ручного старта/стопа
 async def start_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_admin(user.id):
-        await update.effective_message.reply_text("🚫 Доступ запрещён.", reply_markup=_current_keyboard(context, user.id))
+        await update.effective_message.reply_text("🚫 Доступ запрещён.",
+                                                  reply_markup=_current_keyboard(context, user.id))
         return
     _set_session_active(context, user.id, True)
     _ws_reset(context, user.id)
     _ws_get(context, user.id)
     await update.effective_message.reply_text(
         "🚀 Режим тренировки включён (админ). Жми «▶️ Начать тренировку». Будет 3 снимка с паузами отдыха.",
-        reply_markup = await _build_workout_keyboard(context, user.id)
-    )
+        reply_markup=await _build_workout_keyboard(context, user.id))
+
 
 async def end_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_admin(user.id):
-        await update.effective_message.reply_text("🚫 Доступ запрещён.", reply_markup=_current_keyboard(context, user.id))
+        await update.effective_message.reply_text("🚫 Доступ запрещён.",
+                                                  reply_markup=_current_keyboard(context, user.id))
         return
     _set_session_active(context, user.id, False)
     _ws_reset(context, user.id)
     await update.effective_message.reply_text("🛑 Режим тренировки выключен (админ).",
                                               reply_markup=_make_keyboard(False, user.id))
+
+
 async def deposit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     data = cq.data or ""
-    user = update.effective_user
+   
+    user = update.effective_user  # ✅ тут он уже есть
+    name = f"@{user.username}" if user.username else (user.first_name or "name")
     await _safe_cq_answer(cq)
 
     # Достаём текущую анкету (training_form)
@@ -2509,10 +2486,8 @@ async def deposit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async with Database.acquire() as conn:
-                await conn.execute(
-                    "UPDATE users SET training_form = $2 WHERE user_id = $1",
-                    user.id, json.dumps(tf, ensure_ascii=False)
-                )
+                await conn.execute("UPDATE users SET training_form = $2 WHERE user_id = $1", user.id,
+                                   json.dumps(tf, ensure_ascii=False))
             await cq.message.reply_text("✅ Новая заморозка запущена. Удачи!")
         except Exception as e:
             logger.exception("depwin_repeat save failed: %s", e)
@@ -2553,10 +2528,8 @@ async def deposit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tf["deposit_started_at"] = datetime.now(_tz_for(user.id)).isoformat()
 
             async with Database.acquire() as conn:
-                await conn.execute(
-                    "UPDATE users SET training_form = $2 WHERE user_id = $1",
-                    user.id, json.dumps(tf, ensure_ascii=False)
-                )
+                await conn.execute("UPDATE users SET training_form = $2 WHERE user_id = $1", user.id,
+                                   json.dumps(tf, ensure_ascii=False))
             await cq.message.reply_text("✅ Новая заморозка запущена. Удачи!")
         except Exception as e:
             logger.exception("depforf_restart save failed: %s", e)
